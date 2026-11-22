@@ -1,4 +1,4 @@
-"""Token accounting, step decoding, file detection, and subagent discovery."""
+"""Token accounting, step decoding, and file detection."""
 
 from __future__ import annotations
 
@@ -6,21 +6,105 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
-from .protobuf import Msg, encode_varint
+from .protobuf import Msg, encode_varint, iter_fields
 
 # --- Wire & enum constants ---------------------------------------------------
 
+# Step payload field numbers on gemini_coder.Step
 STEP_CODE_ACTION = 10
 STEP_VIEW_FILE = 14
 STEP_USER_INPUT = 19
 STEP_PLANNER_RESPONSE = 20
 STEP_CHECKPOINT = 30
 STEP_GENERIC = 140
+
+# Step envelope field numbers
+STEP_FIELD_TYPE = 1
+STEP_FIELD_STATUS = 4
+STEP_FIELD_METADATA = 5
+STEP_ENVELOPE_FIELDS = (STEP_FIELD_TYPE, STEP_FIELD_STATUS, STEP_FIELD_METADATA)
+
+# Step type enum values
+STEP_TYPE_UNSPECIFIED = 0
+STEP_TYPE_FINISH = 2
+STEP_TYPE_VIEW_FILE = 8
+STEP_TYPE_USER_INPUT = 14
+STEP_TYPE_PLANNER_RESPONSE = 15
+STEP_TYPE_ERROR_MESSAGE = 17
+STEP_TYPE_CHECKPOINT = 23
+STEP_TYPE_SYSTEM_MESSAGE = 101
+STEP_TYPE_INVOKE_SUBAGENT = 127
 GENERIC_TYPE = 132
+
+# Step status enum values
+STATUS_PENDING = 1
+STATUS_RUNNING = 2
 STATUS_DONE = 3
+STEP_STATUS_ACTIVE = (STATUS_PENDING, STATUS_RUNNING)
+
 ORIGINAL_STEP_TYPE_URL = "/gemini_coder.Step"
+
+# Step payload & metadata field numbers
+CODE_ACTION_RESULT_FIELD = 2
+CODE_ACTION_EDIT_FIELD = 1
+CODE_ACTION_EDIT_URI_FIELD = 8
+CODE_ACTION_IS_ARTIFACT_FIELD = 21
+CODE_ACTION_IS_KNOWLEDGE_FIELD = 24
+VIEW_FILE_PATH_FIELD = 1
+VIEW_FILE_IS_SKILL_FIELD = 17
+
+MD_TOOL_CALL_FIELD = 4
+MD_USAGE_FIELD = 9
+MD_OUTPUT_TOKENS_FIELD = 23
+MD_RETRY_INFO_FIELD = 28
+
+CHECKPOINT_INDEX_FIELD = 1
+CHECKPOINT_SUMMARY_ALT_FIELD = 3
+CHECKPOINT_INTENT_FIELD = 4
+CHECKPOINT_START_FIELD = 11
+CHECKPOINT_END_FIELD = 12
+
+# GenMetadata / Chat / Usage / ContextWindowMetadata field numbers
+GEN_CHAT_FIELD = 1
+CHAT_SYSTEM_PROMPT_FIELD = 1
+CHAT_MESSAGES_FIELD = 2
+CHAT_USAGE_FIELD = 4
+CHAT_TOOLS_FIELD = 8
+CHAT_START_FIELD = 9
+CHAT_MODEL_ID_ALT_FIELD = 11
+CHAT_SYSTEM_SECTIONS_FIELD = 16
+CHAT_MODEL_ID_FIELD = 19
+CHAT_MODEL_NAME_FIELD = 21
+
+USAGE_UNCACHED_INPUT_FIELD = 2
+USAGE_OUTPUT_FIELD = 3
+USAGE_CACHED_INPUT_FIELD = 5
+USAGE_THINKING_FIELD = 9
+USAGE_RESPONSE_FIELD = 10
+
+CHAT_START_CHECKPOINT_FIELD = 2
+CHAT_START_CWM_FIELD = 10
+CWM_BREAKDOWN_FIELD = 3
+CWM_REQUEST_BUDGET_FIELD = 4
+
+GEN_CHAT_FIELDS = frozenset({GEN_CHAT_FIELD})
+CHAT_CONTENT_FIELDS = frozenset({
+    CHAT_SYSTEM_PROMPT_FIELD,
+    CHAT_MESSAGES_FIELD,
+    CHAT_TOOLS_FIELD,
+    CHAT_SYSTEM_SECTIONS_FIELD,
+})
+CHAT_SCAN_FIELDS = CHAT_CONTENT_FIELDS | {CHAT_USAGE_FIELD, CHAT_START_FIELD}
+CHAT_TELEMETRY_FIELDS = frozenset({CHAT_USAGE_FIELD, CHAT_START_FIELD})
+USAGE_TELEMETRY_FIELDS = frozenset({
+    USAGE_UNCACHED_INPUT_FIELD,
+    USAGE_OUTPUT_FIELD,
+    USAGE_CACHED_INPUT_FIELD,
+    USAGE_THINKING_FIELD,
+})
+CHAT_START_CHECKPOINT_FIELDS = frozenset({CHAT_START_CHECKPOINT_FIELD})
 
 TOKEN_SYSTEM_PROMPT = 1
 TOKEN_TOOLS = 2
@@ -32,6 +116,12 @@ TOKEN_CHAT_MESSAGES = 7
 TOKEN_WORKFLOWS = 8
 TOKEN_PLUGINS = 9
 TOKEN_FLOWS = 10
+
+SYSTEM_PROMPT_SUBGROUPS = {
+    "flows": TOKEN_FLOWS,
+    "skills": TOKEN_SKILLS,
+    "subagents": TOKEN_SUBAGENTS,
+}
 
 GROUP_LABELS = {
     TOKEN_SYSTEM_PROMPT: "System prompt",
@@ -110,6 +200,7 @@ CATEGORIES = [
 ]
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+CONV_ID_JSON_RE = re.compile(rf'"conversationId"\s*:\s*"({UUID_RE.pattern})"', re.IGNORECASE)
 
 
 # --- Formatting helpers ------------------------------------------------------
@@ -135,21 +226,21 @@ def shorten_path(uri: str) -> str:
         p = unquote(parsed.path)
         if len(p) > 2 and p[0] == "/" and p[2] == ":":
             p = p[1:]
-    home = str(Path.home()).replace("\\", "/")
+    home = str(Path.home()).replace("\\", "/").rstrip("/")
     p = p.replace("\\", "/")
-    if p.startswith(home):
+    if home and (p == home or p.startswith(home + "/")):
         return "~" + p[len(home) :]
     return p
 
 
 def step_category(step_type: int) -> int:
-    if step_type == 14:
+    if step_type == STEP_TYPE_USER_INPUT:
         return CAT_USER
-    if step_type == 15:
+    if step_type == STEP_TYPE_PLANNER_RESPONSE:
         return CAT_AGENT
-    if step_type == 23:
+    if step_type == STEP_TYPE_CHECKPOINT:
         return CAT_CHECKPOINT
-    if step_type in (0, 2, 101):
+    if step_type in (STEP_TYPE_UNSPECIFIED, STEP_TYPE_FINISH, STEP_TYPE_SYSTEM_MESSAGE):
         return CAT_SYSTEM
     return CAT_TOOL
 
@@ -180,10 +271,11 @@ class Step:
     def __init__(self, pos: int, payload: bytes, step_type: int, status: int, metadata: bytes | None):
         self.pos = pos
         self.pb = Msg(payload)
-        self.type = self.pb.int(1) if self.pb.has(1) else step_type
-        self.status = self.pb.int(4) if self.pb.has(4) else status
-        self.md = self.pb.msg(5) or Msg(metadata)
+        self.type = self.pb.int(STEP_FIELD_TYPE) if self.pb.has(STEP_FIELD_TYPE) else step_type
+        self.status = self.pb.int(STEP_FIELD_STATUS) if self.pb.has(STEP_FIELD_STATUS) else status
+        self.md = self.pb.msg(STEP_FIELD_METADATA) or Msg(metadata)
         self.view_file_override: Msg | None = None
+        self.generic_result_text: str = ""
         if self.type == GENERIC_TYPE:
             self._rehydrate()
 
@@ -191,28 +283,41 @@ class Step:
         generic = self.pb.msg(STEP_GENERIC)
         if generic is None:
             return
+        res = generic.msg(2)
+        if res is not None:
+            self.generic_result_text = res.str(1)
         original = packed_original_step(generic)
         if original is not None:
             self.pb = Msg(original)
-            self.type = self.pb.int(1)
-            self.md = self.pb.msg(5) or Msg(b"")
+            self.type = self.pb.int(STEP_FIELD_TYPE)
+            self.md = self.pb.msg(STEP_FIELD_METADATA) or self.md
             return
-        tc = self.md.msg(4)
+        tc = self.md.msg(MD_TOOL_CALL_FIELD)
         if tc is None or tc.str(2) not in ("view_file", "read_file"):
             return
         try:
             args = json.loads(tc.str(3) or "{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            return
+        if not isinstance(args, dict):
             return
         path = next(
             (args[k] for k in ("AbsolutePath", "Path", "FilePath") if isinstance(args.get(k), str) and args[k]),
             "",
         )
         if path:
-            self.type = 8
+            self.type = STEP_TYPE_VIEW_FILE
             encoded = path.encode("utf-8")
+            skill_flag = (
+                encode_varint((VIEW_FILE_IS_SKILL_FIELD << 3) | 0) + b"\x01"
+                if is_skill_file(path)
+                else b""
+            )
             self.view_file_override = Msg(
-                b"\x0a" + encode_varint(len(encoded)) + encoded + (b"\x88\x01\x01" if is_skill_file(path) else b"")
+                encode_varint((VIEW_FILE_PATH_FIELD << 3) | 2)
+                + encode_varint(len(encoded))
+                + encoded
+                + skill_flag
             )
 
     def payload(self, fn: int) -> Msg | None:
@@ -229,31 +334,32 @@ def estimate_step_tokens(step: Step) -> int:
     elif pr is not None:
         n = len(pr.bytes(1))
     else:
-        tc = step.md.msg(4)
+        tc = step.md.msg(MD_TOOL_CALL_FIELD)
         n = len(tc.bytes(3)) if tc else 0
-        out = step.md.int(23, signed32=True)
+        out = step.md.int(MD_OUTPUT_TOKENS_FIELD, signed32=True)
         if out > 0:
             return out
     return max(1, int(n / 4)) if n > 0 else 0
 
 
 def step_tokens(step: Step) -> int:
-    usage = step.md.msg(9)
+    usage = step.md.msg(MD_USAGE_FIELD)
     if usage is not None:
-        return usage.int(3)
+        return usage.int(USAGE_OUTPUT_FIELD)
     return estimate_step_tokens(step)
 
 
 def compaction_tokens(step: Step) -> int:
-    for ri in reversed(step.md.msgs(28)):
+    for ri in reversed(step.md.msgs(MD_RETRY_INFO_FIELD)):
         usage = ri.msg(2)
         if usage is None:
             continue
-        resp = usage.int(10)
+        resp = usage.int(USAGE_RESPONSE_FIELD)
         if resp:
             return resp
-        out, thinking = usage.int(3), usage.int(9)
-        return out - thinking if thinking < out else 0
+        out, thinking = usage.int(USAGE_OUTPUT_FIELD), usage.int(USAGE_THINKING_FIELD)
+        if out > thinking:
+            return out - thinking
     return 0
 
 
@@ -262,17 +368,17 @@ def checkpoint_summary_tokens(step: Step) -> int:
     if t:
         return t
     ck = step.payload(STEP_CHECKPOINT) or Msg(b"")
-    text = ck.str(4) or ck.str(3)
+    text = ck.str(CHECKPOINT_INTENT_FIELD) or ck.str(CHECKPOINT_SUMMARY_ALT_FIELD)
     return max(1, int(len(text.encode("utf-8")) / 4)) if text else 0
 
 
 def checkpoint_newer_than_generation(steps: list[Step], chat_start: Msg | None) -> tuple[int, Step | None]:
-    gen_ck = chat_start.int(2, signed32=True) if chat_start is not None else -1
+    gen_ck = chat_start.int(CHAT_START_CHECKPOINT_FIELD, signed32=True) if chat_start is not None else -1
     for i in range(len(steps) - 1, -1, -1):
         s = steps[i]
-        if s.type == 23 and s.status == STATUS_DONE:
+        if s.type == STEP_TYPE_CHECKPOINT and s.status == STATUS_DONE:
             ck = s.payload(STEP_CHECKPOINT)
-            if ck is not None and ck.int(1) > gen_ck:
+            if ck is not None and ck.int(CHECKPOINT_INDEX_FIELD) > gen_ck:
                 return i, s
             break
     return -1, None
@@ -287,7 +393,7 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
         if not sep or not re.fullmatch(r"[+-]?[0-9]+", left) or right not in STEP_TYPES:
             return False, [0, 0, 0, 0]
         cat = step_category(STEP_TYPES[right])
-        tok = it.int(3, signed32=True)
+        tok = max(0, it.int(3, signed32=True))
         if cat == CAT_USER:
             out[0] += tok
         elif cat in (CAT_AGENT, CAT_CHECKPOINT):
@@ -302,91 +408,260 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
 # --- Model & DB helpers ------------------------------------------------------
 
 
-def load_db(db_path: Path) -> tuple[list[Step], Msg | None, Msg | None]:
-    """Read steps and latest generation records from a conversation SQLite DB."""
-    uri = f"file:{db_path.as_posix()}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=2.5)
+MAX_HISTORY_POINTS = 120
+
+
+def _telemetry_from_views(usage_mv: memoryview, start_mv: memoryview | None) -> dict | None:
+    uncached = output = cached = thinking = 0
+    for fn, val in iter_fields(usage_mv, USAGE_TELEMETRY_FIELDS):
+        if not isinstance(val, int):
+            continue
+        if fn == USAGE_UNCACHED_INPUT_FIELD:
+            uncached = val
+        elif fn == USAGE_OUTPUT_FIELD:
+            output = val
+        elif fn == USAGE_CACHED_INPUT_FIELD:
+            cached = val
+        elif fn == USAGE_THINKING_FIELD:
+            thinking = val
+
+    total_in = uncached + cached
+    if total_in <= 0:
+        return None
+
+    active_ck = -1
+    if start_mv is not None:
+        active_ck = 0
+        for fn, val in iter_fields(start_mv, CHAT_START_CHECKPOINT_FIELDS):
+            if fn == CHAT_START_CHECKPOINT_FIELD and isinstance(val, int):
+                active_ck = val - (1 << 64) if val >= (1 << 63) else val
+
+    return {
+        "tokens": total_in,
+        "cached_tokens": cached,
+        "output_tokens": output,
+        "thinking_tokens": thinking,
+        "active_checkpoint": active_ck,
+    }
+
+
+def extract_turn_telemetry(data: bytes | bytearray | memoryview) -> dict | None:
+    """Fast zero-copy extractor for per-turn usage & checkpoint from a gen_metadata blob."""
+    chat_mv = None
+    for fn, val in iter_fields(data, GEN_CHAT_FIELDS):
+        if fn == GEN_CHAT_FIELD and isinstance(val, memoryview):
+            chat_mv = val
+    if chat_mv is None:
+        return None
+
+    usage_mv = None
+    start_mv = None
+    for fn, val in iter_fields(chat_mv, CHAT_TELEMETRY_FIELDS):
+        if fn == CHAT_USAGE_FIELD and isinstance(val, memoryview):
+            usage_mv = val
+        elif fn == CHAT_START_FIELD and isinstance(val, memoryview):
+            start_mv = val
+
+    if usage_mv is None:
+        return None
+    return _telemetry_from_views(usage_mv, start_mv)
+
+
+def compute_history_and_session(raw_turns: list[dict]) -> tuple[list[dict], dict | None]:
+    """Build turn-by-turn sparkline history and weighted session cache/output summary."""
+    if not raw_turns:
+        return [], None
+
+    full_turns: list[dict] = []
+    prev_tokens = 0
+    prev_ck = -1
+    total_output = 0
+    total_thinking = 0
+    warm_cached = 0
+    warm_input = 0
+
+    for i, t in enumerate(raw_turns):
+        tok = t["tokens"]
+        cached = t["cached_tokens"]
+        out_tok = t["output_tokens"]
+        think_tok = t["thinking_tokens"]
+        ck = t["active_checkpoint"]
+
+        delta = tok - prev_tokens if i > 0 else 0
+        compacted = bool(i > 0 and ck > prev_ck)
+        hit_pct = round(pct(cached, tok), 1)
+
+        total_output += out_tok
+        total_thinking += think_tok
+        if i > 0:
+            warm_cached += cached
+            warm_input += tok
+
+        full_turns.append({
+            "turn": i + 1,
+            "tokens": tok,
+            "delta": delta,
+            "cache_hit_pct": hit_pct,
+            "output_tokens": out_tok,
+            "compacted": compacted,
+        })
+        prev_tokens = tok
+        prev_ck = ck
+
+    n = len(full_turns)
+    avg_cache = round(pct(warm_cached, warm_input), 1) if warm_input > 0 else full_turns[0]["cache_hit_pct"]
+    last = full_turns[-1]
+    prev = full_turns[-2] if n > 1 else None
+    had_active_cache = bool(prev is not None and (prev["cache_hit_pct"] >= 50.0 or avg_cache >= 50.0))
+    cache_drop = bool(n > 1 and had_active_cache and last["cache_hit_pct"] < 50.0 and not last["compacted"])
+    cache_drop_after_compact = bool(n > 1 and had_active_cache and last["cache_hit_pct"] < 50.0 and last["compacted"])
+
+    session_usage = {
+        "turns": n,
+        "total_output_tokens": total_output,
+        "total_thinking_tokens": total_thinking,
+        "avg_cache_hit_pct": avg_cache,
+        "cache_drop": cache_drop,
+        "cache_drop_after_compact": cache_drop_after_compact,
+    }
+
+    history = full_turns[-MAX_HISTORY_POINTS:] if n > MAX_HISTORY_POINTS else full_turns
+    return history, session_usage
+
+
+def sqlite_ro_uri(db_path: Path) -> str:
+    """Build a percent-encoded SQLite read-only file URI."""
+    return f"file:{quote(db_path.resolve().as_posix(), safe='/:')}?mode=ro"
+
+
+def load_db_with_history(db_path: Path) -> tuple[list[Step], Msg | None, Msg | None, list[dict], dict | None]:
+    """Read steps, latest generation records, and per-turn telemetry in a single read-only pass."""
+    uri = sqlite_ro_uri(db_path)
+    con = sqlite3.connect(uri, uri=True, timeout=2.5, isolation_level=None)
+    raw_turns: list[dict] = []
+    latest_stats_bytes: bytes | None = None
+    latest_content_bytes: bytes | None = None
+    began = False
     try:
+        con.execute("BEGIN")
+        began = True
         steps = [
             Step(idx, payload, stype, status, md)
             for idx, payload, stype, status, md in con.execute(
                 "SELECT idx, step_payload, step_type, status, metadata FROM steps ORDER BY idx ASC"
             )
         ]
-        gen_rows = con.execute(
-            "SELECT idx, data FROM gen_metadata ORDER BY idx DESC LIMIT 20"
-        ).fetchall()
+        for (data,) in con.execute(
+            "SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC"
+        ):
+            if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+                continue
+            chat_mv = None
+            for fn, val in iter_fields(data, GEN_CHAT_FIELDS):
+                if fn == GEN_CHAT_FIELD and isinstance(val, memoryview):
+                    chat_mv = val
+            if chat_mv is None:
+                continue
+            has_content = False
+            usage_mv = None
+            start_mv = None
+            for fn, val in iter_fields(chat_mv, CHAT_SCAN_FIELDS):
+                if fn in CHAT_CONTENT_FIELDS:
+                    has_content = True
+                elif fn == CHAT_USAGE_FIELD and isinstance(val, memoryview):
+                    usage_mv = val
+                elif fn == CHAT_START_FIELD and isinstance(val, memoryview):
+                    start_mv = val
+            latest_stats_bytes = data
+            if has_content:
+                latest_content_bytes = data
+            if usage_mv is not None:
+                tel = _telemetry_from_views(usage_mv, start_mv)
+                if tel is not None:
+                    raw_turns.append(tel)
     finally:
+        if began:
+            try:
+                con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
         con.close()
 
-    latest_stats: Msg | None = None
-    latest_content: Msg | None = None
-    for _, data in gen_rows:
-        if not data:
-            continue
-        gm = Msg(data)
-        chat = gm.msg(1)
-        if chat is None:
-            continue
-        if latest_stats is None:
-            latest_stats = gm
-        if latest_content is None and (chat.has(2) or chat.has(16) or chat.has(8) or chat.has(1)):
-            latest_content = gm
-        if latest_stats is not None and latest_content is not None:
-            break
+    latest_stats: Msg | None = Msg(latest_stats_bytes) if latest_stats_bytes is not None else None
+    if latest_content_bytes is latest_stats_bytes:
+        latest_content = latest_stats
+    else:
+        latest_content = Msg(latest_content_bytes) if latest_content_bytes is not None else None
 
+    history, session_usage = compute_history_and_session(raw_turns)
+    return steps, latest_stats, latest_content, history, session_usage
+
+
+def load_db(db_path: Path) -> tuple[list[Step], Msg | None, Msg | None]:
+    """Read steps and latest generation records from a conversation SQLite DB."""
+    steps, latest_stats, latest_content, _, _ = load_db_with_history(db_path)
     return steps, latest_stats, latest_content
 
 
 def extract_model_id(gen: Msg | None) -> str:
-    chat = gen.msg(1) if gen is not None else None
+    chat = gen.msg(GEN_CHAT_FIELD) if gen is not None else None
     if chat is None:
         return ""
-    return chat.str(19) or chat.str(11) or ""
+    return chat.str(CHAT_MODEL_ID_FIELD) or chat.str(CHAT_MODEL_ID_ALT_FIELD) or ""
 
 
 def extract_model_name(gen: Msg | None) -> str:
-    chat = gen.msg(1) if gen is not None else None
+    chat = gen.msg(GEN_CHAT_FIELD) if gen is not None else None
     if chat is None:
         return "Unknown Model"
-    if chat.str(21):
-        return chat.str(21)
+    if chat.str(CHAT_MODEL_NAME_FIELD):
+        return chat.str(CHAT_MODEL_NAME_FIELD)
     return extract_model_id(gen) or "Unknown Model"
 
 
 def extract_request_budget(gen: Msg | None) -> int:
-    chat = gen.msg(1) if gen is not None else None
-    start = chat.msg(9) if chat is not None else None
-    cwm = start.msg(10) if start is not None else None
-    return cwm.int(4, signed32=True) if cwm is not None else 0
+    chat = gen.msg(GEN_CHAT_FIELD) if gen is not None else None
+    start = chat.msg(CHAT_START_FIELD) if chat is not None else None
+    cwm = start.msg(CHAT_START_CWM_FIELD) if start is not None else None
+    return cwm.int(CWM_REQUEST_BUDGET_FIELD, signed32=True) if cwm is not None else 0
 
 
 def infer_context_limit(gen: Msg | None) -> int:
-    slug = extract_model_id(gen).lower()
-    name = extract_model_name(gen).lower()
+    slug = re.sub(r"[\s_]+", "-", extract_model_id(gen).strip().lower())
+    name = re.sub(r"[\s_]+", "-", extract_model_name(gen).strip().lower())
     for prefix, tokens in NATIVE_CONTEXT_WINDOWS:
-        if slug.startswith(prefix) or prefix in name:
+        if len(prefix) <= 2:
+            pat = rf"(?<![a-z0-9]){re.escape(prefix)}(?![a-z0-9])"
+            if re.search(pat, slug) or re.search(pat, name):
+                return tokens
+        elif slug.startswith(prefix) or prefix in name:
             return tokens
     return extract_request_budget(gen)
 
 
-# --- Stats, files, and subagents ---------------------------------------------
+# --- Stats and files ---------------------------------------------------------
 
 
-def detect_system_files(home: str, workspace: str | None, app_dir: str) -> list[dict]:
-    if not home:
+def detect_system_files(
+    home: str,
+    workspace: str | None,
+    app_dir: str,
+    gemini_dir: str | Path | None = None,
+) -> list[dict]:
+    if not home and not gemini_dir:
         return []
-    gemini = Path(home) / ".gemini"
+    gemini = Path(gemini_dir).expanduser() if gemini_dir else Path(home) / ".gemini"
+    prefix = shorten_path(str(gemini)).rstrip("/") if gemini_dir else "~/.gemini"
     found = []
     if (gemini / "GEMINI.md").is_file():
-        found.append("~/.gemini/GEMINI.md")
+        found.append(f"{prefix}/GEMINI.md")
     for sub in ("skills", "rules", "agents", "global_workflows"):
         if (gemini / sub).is_dir():
-            found.append(f"~/.gemini/{sub}/")
+            found.append(f"{prefix}/{sub}/")
     if app_dir:
         for sub in ("rules", "skills", "agents", "global_workflows"):
             if (gemini / app_dir / sub).is_dir():
-                found.append(f"~/.gemini/{app_dir}/{sub}/")
+                found.append(f"{prefix}/{app_dir}/{sub}/")
     if workspace:
         ws = Path(workspace)
         for root in (".agents", "_agents"):
@@ -413,8 +688,8 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
     checkpoints, knowledge, artifacts, skill_files = [], [], [], []
     seen_k, seen_a, seen_s = set(), set(), set()
 
-    chat = gen.msg(1) if gen is not None else None
-    chat_start = chat.msg(9) if chat is not None else None
+    chat = gen.msg(GEN_CHAT_FIELD) if gen is not None else None
+    chat_start = chat.msg(CHAT_START_FIELD) if chat is not None else None
     newer_pos, newer_step = checkpoint_newer_than_generation(steps, chat_start)
     has_newer = newer_step is not None
     st["compacted"] = has_newer
@@ -434,47 +709,49 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
             ck = step.payload(STEP_CHECKPOINT)
             if ck is not None:
                 checkpoints.append({
-                    "index": ck.int(1),
-                    "start": ck.int(11),
-                    "end": ck.int(12),
-                    "intent": ck.str(4),
+                    "index": ck.int(CHECKPOINT_INDEX_FIELD),
+                    "start": ck.int(CHECKPOINT_START_FIELD),
+                    "end": ck.int(CHECKPOINT_END_FIELD),
+                    "intent": ck.str(CHECKPOINT_INTENT_FIELD),
                 })
         else:
             st["system_messages"] += counted
 
         ca = step.payload(STEP_CODE_ACTION)
-        result = ca.msg(2) if ca is not None else None
-        edit = result.msg(1) if result is not None else None
+        result = ca.msg(CODE_ACTION_RESULT_FIELD) if ca is not None else None
+        edit = result.msg(CODE_ACTION_EDIT_FIELD) if result is not None else None
         if edit is not None:
-            uri = edit.str(8)
+            uri = edit.str(CODE_ACTION_EDIT_URI_FIELD)
             short = shorten_path(uri)
-            if ca.int(21) and uri not in seen_a:
+            if ca.int(CODE_ACTION_IS_ARTIFACT_FIELD) and uri not in seen_a:
                 seen_a.add(uri)
                 artifacts.append({"path": short, "tokens": tok})
-            if ca.int(24) and uri not in seen_k:
+            if ca.int(CODE_ACTION_IS_KNOWLEDGE_FIELD) and uri not in seen_k:
                 seen_k.add(uri)
                 knowledge.append({"path": short, "tokens": tok})
 
         vf = step.payload(STEP_VIEW_FILE)
-        if vf is not None and vf.int(17):
-            uri = vf.str(1)
+        if vf is not None and vf.int(VIEW_FILE_IS_SKILL_FIELD):
+            uri = vf.str(VIEW_FILE_PATH_FIELD)
             if uri not in seen_s:
                 seen_s.add(uri)
                 skill_files.append({"path": shorten_path(uri), "tokens": tok})
 
-    cwm = chat_start.msg(10) if chat_start is not None else None
-    breakdown = cwm.msg(3) if cwm is not None else None
+    cwm = chat_start.msg(CHAT_START_CWM_FIELD) if chat_start is not None else None
+    breakdown = cwm.msg(CWM_BREAKDOWN_FIELD) if cwm is not None else None
 
     if breakdown is not None:
         st["has_breakdown"] = True
         seen_prompt = seen_tools = False
         chat_tok, chat_items = 0, []
         for g in breakdown.msgs(1):
-            gtype, gtok = g.int(2), g.int(4, signed32=True)
+            gtype = g.int(2)
+            gtok = max(0, g.int(4, signed32=True))
             if gtype == TOKEN_SYSTEM_PROMPT:
                 extracted = 0
                 for child in g.msgs(5):
-                    name, ctok = child.str(1), child.int(3, signed32=True)
+                    name = child.str(1)
+                    ctok = max(0, child.int(3, signed32=True))
                     if name == "flows":
                         st["workflows"] += ctok
                     elif name == "skills":
@@ -484,10 +761,10 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
                     else:
                         continue
                     extracted += ctok
-                st["system_prompt"] = gtok - extracted
+                st["system_prompt"] += max(0, gtok - extracted)
                 seen_prompt = True
             elif gtype == TOKEN_TOOLS:
-                st["system_tools"] = gtok
+                st["system_tools"] += gtok
                 seen_tools = True
             elif gtype == TOKEN_RULES:
                 st["rules"] += gtok
@@ -498,7 +775,8 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
             elif gtype == TOKEN_SUBAGENTS:
                 st["subagents"] += gtok
             elif gtype == TOKEN_CHAT_MESSAGES:
-                chat_tok, chat_items = gtok, g.msgs(5)
+                chat_tok += gtok
+                chat_items.extend(g.msgs(5))
             elif gtype == TOKEN_WORKFLOWS:
                 st["legacy_workflows"] += gtok
             elif gtype == TOKEN_PLUGINS:
@@ -506,33 +784,42 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
             elif gtype == TOKEN_FLOWS:
                 st["workflows"] += gtok
 
-        if not seen_prompt and not seen_tools and chat_tok and chat is not None:
-            usage = chat.msg(4)
-            api_input = (usage.int(2) + usage.int(5)) if usage is not None else 0
-            if chat_tok < api_input:
-                st["system_overhead"] = api_input - chat_tok
+        if not seen_prompt and not seen_tools and chat_tok > 0 and chat is not None:
+            usage = chat.msg(CHAT_USAGE_FIELD)
+            api_input = (
+                usage.int(USAGE_UNCACHED_INPUT_FIELD) + usage.int(USAGE_CACHED_INPUT_FIELD)
+                if usage is not None
+                else 0
+            )
+            known_custom = (
+                st["rules"] + st["skills"] + st["subagents"]
+                + st["legacy_workflows"] + st["workflows"] + st["plugins"] + st["mcp_tools"]
+            )
+            st["system_overhead"] = max(0, api_input - chat_tok - known_custom)
 
-        if chat_tok and not has_newer:
+        if chat_tok > 0 and not has_newer:
             ok, cats = chat_tokens_by_category(chat_items)
             if ok:
                 st["user"], st["agent"], st["tool"], st["system_messages"] = cats
             else:
-                est = st["user"] + st["agent"] + st["tool"]
+                est = st["user"] + st["agent"] + st["tool"] + st["system_messages"]
                 if est == 0:
                     st["agent"] = chat_tok
+                    st["system_messages"] = 0
                 else:
                     f = chat_tok / est
                     st["user"] = int(st["user"] * f)
                     st["agent"] = int(st["agent"] * f)
                     st["tool"] = int(st["tool"] * f)
+                    st["system_messages"] = int(st["system_messages"] * f)
 
     if chat_start is not None:
-        st["active_checkpoint"] = chat_start.int(2, signed32=True)
+        st["active_checkpoint"] = chat_start.int(CHAT_START_CHECKPOINT_FIELD, signed32=True)
     if has_newer and newer_step is not None:
         st["agent"] += checkpoint_summary_tokens(newer_step)
         ck = newer_step.payload(STEP_CHECKPOINT)
         if ck is not None:
-            st["active_checkpoint"] = ck.int(1)
+            st["active_checkpoint"] = ck.int(CHECKPOINT_INDEX_FIELD)
 
     st["total"] = sum(
         st[k]
@@ -548,18 +835,18 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> tuple[dict,
     st["artifact_files"] = artifacts
     st["skill_files"] = skill_files
 
-    usage = chat.msg(4) if chat is not None else None
+    usage = chat.msg(CHAT_USAGE_FIELD) if chat is not None else None
     if usage is not None:
-        uncached = usage.int(2)
-        cached = usage.int(5)
+        uncached = usage.int(USAGE_UNCACHED_INPUT_FIELD)
+        cached = usage.int(USAGE_CACHED_INPUT_FIELD)
         total_in = uncached + cached
         st["api_usage"] = {
             "input_tokens": uncached,
             "cached_tokens": cached,
             "total_input_tokens": total_in,
-            "output_tokens": usage.int(3),
-            "thinking_tokens": usage.int(9),
-            "response_tokens": usage.int(10),
+            "output_tokens": usage.int(USAGE_OUTPUT_FIELD),
+            "thinking_tokens": usage.int(USAGE_THINKING_FIELD),
+            "response_tokens": usage.int(USAGE_RESPONSE_FIELD),
             "cache_hit_pct": round(pct(cached, total_in), 1) if total_in > 0 else 0.0,
         }
     else:
@@ -584,116 +871,3 @@ def stats_heading(st: dict) -> str:
     if st["has_breakdown"]:
         return "Exact token usage from latest model call"
     return "Estimated usage (awaiting first generation)"
-
-
-def quick_subagent_stats(sub_db: Path, catalog: dict) -> dict | None:
-    """Fast read-only summary for a subagent conversation database."""
-    if not sub_db.is_file():
-        return None
-    uri = f"file:{sub_db.as_posix()}?mode=ro"
-    try:
-        con = sqlite3.connect(uri, uri=True, timeout=1.5)
-        try:
-            last_step = con.execute("SELECT status FROM steps ORDER BY idx DESC LIMIT 1").fetchone()
-            gen_row = con.execute("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").fetchone()
-            step_rows = []
-            if gen_row is None:
-                step_rows = con.execute(
-                    "SELECT idx, step_payload, step_type, status, metadata FROM steps ORDER BY idx ASC"
-                ).fetchall()
-        finally:
-            con.close()
-    except Exception:
-        return None
-
-    gen = Msg(gen_row[0]) if gen_row and gen_row[0] else None
-    steps = [Step(i, pl, st, s, md) for i, pl, st, s, md in step_rows]
-    mid = extract_model_id(gen)
-    cat_entry = catalog.get(mid) or {}
-    limit = int(cat_entry.get("maxTokens") or 0) or infer_context_limit(gen)
-    model = cat_entry.get("displayName") or extract_model_name(gen)
-    budget = extract_request_budget(gen)
-    st, _ = collect_stats(steps, gen, limit)
-    used = st["total"]
-
-    if last_step is None:
-        status = "starting"
-    elif last_step[0] == 2:
-        status = "running"
-    else:
-        status = "idle"
-
-    return {
-        "model": model,
-        "model_id": mid,
-        "used_tokens": used,
-        "limit_tokens": limit,
-        "used_pct": round(min(100.0, pct(used, limit)), 1) if limit else 0.0,
-        "request_budget_tokens": budget,
-        "budget_pct": round(min(100.0, pct(used, budget)), 1) if budget else 0.0,
-        "status": status,
-    }
-
-
-def extract_subagents(steps: list[Step], db_path: Path, catalog: dict) -> list[dict]:
-    """Discover child subagents spawned via invoke_subagent steps."""
-    conv_dir = db_path.parent
-    self_id = db_path.stem.lower()
-    seen: set[str] = set()
-    out: list[dict] = []
-
-    for step in steps:
-        tc = step.md.msg(4)
-        tc_name = tc.str(2) if tc is not None else ""
-        if tc_name != "invoke_subagent" and step.type != 127:
-            continue
-
-        role = ""
-        type_name = ""
-        req_model = ""
-        if tc is not None and tc.str(3):
-            try:
-                args = json.loads(tc.str(3))
-                if isinstance(args, dict):
-                    role = str(args.get("Role") or args.get("role") or "")
-                    type_name = str(args.get("TypeName") or args.get("type_name") or "")
-                    req_model = str(args.get("Model") or args.get("model") or "")
-            except json.JSONDecodeError:
-                pass
-
-        sub_id = ""
-        generic = step.pb.msg(STEP_GENERIC)
-        if generic is not None:
-            res = generic.msg(2)
-            if res is not None:
-                res_text = res.str(1)
-                m = re.search(r'"conversationId"\s*:\s*"([0-9a-f-]{36})"', res_text, re.IGNORECASE)
-                if m:
-                    sub_id = m.group(1).lower()
-                else:
-                    for cand in UUID_RE.findall(res_text):
-                        if cand.lower() != self_id:
-                            sub_id = cand.lower()
-                            break
-
-        if not sub_id or sub_id == self_id or sub_id in seen:
-            continue
-        seen.add(sub_id)
-
-        stats = quick_subagent_stats(conv_dir / f"{sub_id}.db", catalog)
-        out.append({
-            "conversation_id": sub_id,
-            "role": role or type_name or f"Subagent {len(out) + 1}",
-            "type_name": type_name,
-            "requested_model": req_model,
-            "model": stats["model"] if stats else (req_model or "Pending"),
-            "used_tokens": stats["used_tokens"] if stats else 0,
-            "limit_tokens": stats["limit_tokens"] if stats else 0,
-            "used_pct": stats["used_pct"] if stats else 0.0,
-            "request_budget_tokens": stats["request_budget_tokens"] if stats else 0,
-            "budget_pct": stats["budget_pct"] if stats else 0.0,
-            "status": stats["status"] if stats else "starting",
-            "has_db": bool(stats is not None),
-        })
-
-    return out

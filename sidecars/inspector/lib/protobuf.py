@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+def read_varint(buf: bytes | bytearray | memoryview, pos: int) -> tuple[int, int]:
     """Decode an unsigned base-128 varint starting at pos."""
     val = 0
     shift = 0
@@ -14,11 +14,54 @@ def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
         if not (b & 0x80):
             return val, pos
         shift += 7
+        if shift >= 70:
+            raise ValueError("Varint overflow")
     raise ValueError("Truncated varint")
+
+
+def iter_fields(buf: bytes | bytearray | memoryview, want: set[int] | None = None):
+    """Stream wire fields, skipping unwanted fields with zero slice copies."""
+    if not isinstance(buf, (bytes, bytearray, memoryview)):
+        return
+    mv = memoryview(buf)
+    pos, n = 0, len(mv)
+    while pos < n:
+        try:
+            tag, pos = read_varint(mv, pos)
+            fn, wt = tag >> 3, tag & 7
+            if fn == 0:
+                break
+            keep = want is None or fn in want
+            if wt == 0:
+                val, pos = read_varint(mv, pos)
+            elif wt == 2:
+                ln, pos = read_varint(mv, pos)
+                if pos + ln > n:
+                    break
+                val = mv[pos : pos + ln] if keep else None
+                pos += ln
+            elif wt == 1:
+                if pos + 8 > n:
+                    break
+                val = mv[pos : pos + 8] if keep else None
+                pos += 8
+            elif wt == 5:
+                if pos + 4 > n:
+                    break
+                val = mv[pos : pos + 4] if keep else None
+                pos += 4
+            else:
+                break
+        except ValueError:
+            break
+        if keep:
+            yield fn, val
 
 
 def encode_varint(n: int) -> bytes:
     """Encode a non-negative integer as a base-128 varint."""
+    if n < 0:
+        raise ValueError("Varint must be non-negative")
     out = bytearray()
     while True:
         b = n & 0x7F
@@ -35,10 +78,12 @@ class Msg:
 
     __slots__ = ("fields",)
 
-    def __init__(self, buf: bytes | None):
+    def __init__(self, buf: bytes | bytearray | memoryview | None):
         self.fields: dict[int, list] = {}
-        if not buf:
+        if not isinstance(buf, (bytes, bytearray, memoryview)) or not buf:
             return
+        if not isinstance(buf, bytes):
+            buf = bytes(buf)
         pos, n = 0, len(buf)
         while pos < n:
             try:

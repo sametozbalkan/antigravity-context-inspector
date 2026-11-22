@@ -7,31 +7,49 @@ set -euo pipefail
 REPO_URL="https://github.com/sametozbalkan/antigravity-context-inspector.git"
 TAR_URL="https://github.com/sametozbalkan/antigravity-context-inspector/archive/refs/heads/main.tar.gz"
 PLUGIN_DIR="${HOME}/.gemini/config/plugins/context-inspector"
+PARENT_DIR="$(dirname "${PLUGIN_DIR}")"
 
-if [ -d "${PLUGIN_DIR}/.git" ] && command -v git >/dev/null 2>&1; then
+if [ -e "${PLUGIN_DIR}/.git" ] && command -v git >/dev/null 2>&1; then
   echo "Updating Context Inspector via git pull..."
   git -C "${PLUGIN_DIR}" pull --ff-only
   echo "Updated! Toggle Context Inspector off and on in Antigravity Customizations to reload."
   exit 0
 fi
 
-mkdir -p "$(dirname "${PLUGIN_DIR}")"
+mkdir -p "${PARENT_DIR}"
+STAGE_ROOT="$(mktemp -d "${PARENT_DIR}/.tmp-context-inspector.XXXXXX")"
+trap 'rm -rf "${STAGE_ROOT}"' EXIT
 
-if [ -d "${PLUGIN_DIR}" ]; then
+if command -v git >/dev/null 2>&1; then
+  echo "Cloning into ${PLUGIN_DIR}..."
+  STAGE_SRC="${STAGE_ROOT}/repo"
+  git clone "${REPO_URL}" "${STAGE_SRC}"
+else
+  echo "git not found — downloading archive..."
+  EXTRACT_DIR="${STAGE_ROOT}/extract"
+  mkdir -p "${EXTRACT_DIR}"
+  curl --proto '=https' --tlsv1.2 -fsSL "${TAR_URL}" | tar -xz -C "${EXTRACT_DIR}"
+  shopt -s nullglob
+  CANDIDATES=("${EXTRACT_DIR}"/*/)
+  shopt -u nullglob
+  if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+    echo "Error: expected a single extracted directory, found ${#CANDIDATES[@]}." >&2
+    exit 1
+  fi
+  STAGE_SRC="${CANDIDATES[0]%/}"
+fi
+
+if [ ! -f "${STAGE_SRC}/plugin.json" ]; then
+  echo "Error: staged installation is missing plugin.json." >&2
+  exit 1
+fi
+
+if [ -e "${PLUGIN_DIR}" ] || [ -L "${PLUGIN_DIR}" ]; then
   echo "Replacing existing installation at ${PLUGIN_DIR}..."
   rm -rf "${PLUGIN_DIR}"
 fi
 
-if command -v git >/dev/null 2>&1; then
-  echo "Cloning into ${PLUGIN_DIR}..."
-  git clone "${REPO_URL}" "${PLUGIN_DIR}"
-else
-  echo "git not found — downloading archive..."
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "${TMP_DIR}"' EXIT
-  curl -fsSL "${TAR_URL}" | tar -xz -C "${TMP_DIR}"
-  mv "${TMP_DIR}"/antigravity-context-inspector-* "${PLUGIN_DIR}"
-fi
+mv "${STAGE_SRC}" "${PLUGIN_DIR}"
 
 echo ""
 echo "Installed Context Inspector!"

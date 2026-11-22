@@ -19,20 +19,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.accounting import (
     CATEGORIES,
+    CHAT_START_CWM_FIELD,
+    CHAT_START_FIELD,
+    CWM_BREAKDOWN_FIELD,
+    GEN_CHAT_FIELD,
+    UUID_RE,
     collect_stats,
     detect_system_files,
     extract_model_id,
     extract_model_name,
     extract_request_budget,
-    extract_subagents,
     fmt_tok,
     grid_segments,
     infer_context_limit,
-    load_db,
+    load_db_with_history,
     pct,
     stats_heading,
 )
 from lib.content import extract_content_items
+from lib.subagents import extract_subagents
 
 
 def render_cli_text(report: dict) -> str:
@@ -67,7 +72,7 @@ def build_snapshot(
     catalog_path: str | None = None,
     app_dir: str = "antigravity",
 ) -> dict:
-    steps, stats_gen, content_gen = load_db(db_path)
+    steps, stats_gen, content_gen, history, session_usage = load_db_with_history(db_path)
 
     catalog: dict = {}
     catalog_entry: dict = {}
@@ -75,26 +80,36 @@ def build_snapshot(
     if catalog_path and Path(catalog_path).is_file():
         try:
             with open(catalog_path, encoding="utf-8") as fh:
-                catalog = json.load(fh)
-            catalog_entry = catalog.get(mid) or {}
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                catalog = loaded
+                entry = catalog.get(mid)
+                if isinstance(entry, dict):
+                    catalog_entry = entry
         except Exception:
             catalog = {}
             catalog_entry = {}
 
-    limit = int(catalog_entry.get("maxTokens") or 0) or infer_context_limit(stats_gen)
-    model = catalog_entry.get("displayName") or extract_model_name(stats_gen)
+    try:
+        cat_limit = int(catalog_entry.get("maxTokens") or 0)
+    except (TypeError, ValueError):
+        cat_limit = 0
+    limit = cat_limit if cat_limit > 0 else infer_context_limit(stats_gen)
+    display_name = catalog_entry.get("displayName")
+    model = display_name if isinstance(display_name, str) and display_name else extract_model_name(stats_gen)
     budget = extract_request_budget(stats_gen)
 
     st, breakdown = collect_stats(steps, stats_gen, limit)
     content_breakdown = breakdown
     if content_gen is not None and content_gen is not stats_gen:
-        c_chat = content_gen.msg(1)
-        c_start = c_chat.msg(9) if c_chat is not None else None
-        c_cwm = c_start.msg(10) if c_start is not None else None
-        content_breakdown = c_cwm.msg(3) if c_cwm is not None else breakdown
+        c_chat = content_gen.msg(GEN_CHAT_FIELD)
+        c_start = c_chat.msg(CHAT_START_FIELD) if c_chat is not None else None
+        c_cwm = c_start.msg(CHAT_START_CWM_FIELD) if c_start is not None else None
+        content_breakdown = c_cwm.msg(CWM_BREAKDOWN_FIELD) if c_cwm is not None else breakdown
 
     content = extract_content_items(steps, content_gen, content_breakdown, st["total"])
-    system_files = detect_system_files(os.path.expanduser("~"), workspace, app_dir)
+    gemini_dir = os.environ.get("ANTIGRAVITY_GEMINI_DIR") or None
+    system_files = detect_system_files(os.path.expanduser("~"), workspace, app_dir, gemini_dir=gemini_dir)
     subagents = extract_subagents(steps, db_path, catalog)
 
     categories_out = [
@@ -129,6 +144,8 @@ def build_snapshot(
         "grid_segments": grid_segments(st),
         "categories": categories_out,
         "api_usage": st["api_usage"],
+        "history": history,
+        "session_usage": session_usage,
         "knowledge_files": st["knowledge_files"],
         "artifact_files": st["artifact_files"],
         "skill_files": st["skill_files"],
@@ -148,11 +165,38 @@ def build_snapshot(
         [
             summary["used_tokens"],
             summary["limit_tokens"],
+            summary["request_budget_tokens"],
             summary["model"],
+            summary["has_breakdown"],
+            summary["compacted"],
+            summary["checkpoint_buffer"],
+            summary["checkpoints"],
+            [(c["key"], c["tokens"]) for c in categories_out],
+            summary["api_usage"],
+            len(history),
+            history[-1]["tokens"] if history else 0,
+            session_usage,
             summary["counts"],
             len(steps),
             st["active_checkpoint"],
-            [(sa["conversation_id"], sa["used_tokens"], sa["status"]) for sa in subagents],
+            summary["system_files"],
+            summary["skill_files"],
+            summary["artifact_files"],
+            summary["knowledge_files"],
+            [
+                (
+                    sa["conversation_id"],
+                    sa["role"],
+                    sa["model"],
+                    sa["used_tokens"],
+                    sa["limit_tokens"],
+                    sa["request_budget_tokens"],
+                    sa["status"],
+                    sa.get("swarm_state"),
+                    sa.get("source"),
+                )
+                for sa in subagents
+            ],
         ],
         sort_keys=True,
     )
@@ -179,8 +223,15 @@ def main():
     if args.db:
         db_path = Path(args.db).expanduser()
     else:
-        conv_dir = Path.home() / ".gemini" / "antigravity" / "conversations"
+        gemini_base = (
+            Path(os.environ["ANTIGRAVITY_GEMINI_DIR"]).expanduser()
+            if os.environ.get("ANTIGRAVITY_GEMINI_DIR")
+            else Path.home() / ".gemini"
+        )
+        conv_dir = gemini_base / "antigravity" / "conversations"
         if args.conversation_id:
+            if not UUID_RE.fullmatch(args.conversation_id):
+                raise SystemExit(f"Invalid conversation ID: {args.conversation_id}")
             db_path = conv_dir / f"{args.conversation_id}.db"
         else:
             dbs = sorted(conv_dir.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)

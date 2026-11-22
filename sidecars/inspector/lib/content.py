@@ -15,6 +15,7 @@ from .accounting import (
     STEP_PLANNER_RESPONSE,
     STEP_TYPE_NAMES,
     STEP_USER_INPUT,
+    SYSTEM_PROMPT_SUBGROUPS,
     TOKEN_CHAT_MESSAGES,
     TOKEN_FLOWS,
     TOKEN_MCP_TOOLS,
@@ -41,17 +42,72 @@ ROLE_MAP = {
 
 
 def make_preview(text: str, limit: int = 160) -> str:
-    if not text:
+    if not text or limit <= 0:
         return ""
-    flat = re.sub(r"\s+", " ", text).strip()
-    if len(flat) <= limit:
+    parts: list[str] = []
+    total = 0
+    truncated = False
+    chunk_pat = rf"\S{{1,{limit + 1}}}"
+    for m in re.finditer(chunk_pat, text):
+        token = m.group(0)
+        if parts:
+            total += 1
+        if total + len(token) > limit:
+            rem = max(0, limit - 1 - total)
+            if rem > 0:
+                parts.append(token[:rem])
+            truncated = True
+            break
+        parts.append(token)
+        total += len(token)
+    flat = " ".join(parts)
+    if not truncated:
         return flat
-    return flat[: limit - 1].rstrip() + "…"
+    if len(flat) >= limit:
+        flat = flat[: limit - 1]
+    return flat.rstrip() + "…"
+
+
+def extract_mcp_server(name: str) -> str:
+    """Infer MCP server name from common tool naming conventions."""
+    if not name:
+        return "other"
+    if "__" in name:
+        parts = [p for p in name.split("__") if p]
+        if len(parts) >= 2:
+            if parts[0].lower() == "mcp" and len(parts) >= 3:
+                return parts[1]
+            if parts[0].lower() != "mcp":
+                first = parts[0]
+                if first.lower().startswith("mcp_"):
+                    stripped = first[4:]
+                    if "_" in stripped:
+                        server, _, _ = stripped.partition("_")
+                        if server:
+                            return server
+                    elif stripped:
+                        return stripped
+                else:
+                    return first
+    for sep in (":", "/"):
+        if sep in name:
+            prefix = name.split(sep, 1)[0].strip()
+            if prefix.lower().startswith("mcp_"):
+                prefix = prefix[4:]
+            if prefix:
+                return prefix
+    if name.lower().startswith("mcp_"):
+        rest = name[4:]
+        server, sep, _ = rest.partition("_")
+        if sep and server:
+            return server
+    return "other"
 
 
 def parse_breakdown_maps(breakdown: Msg | None) -> dict:
     """Build exact per-item token lookups from ContextWindowMetadata.breakdown."""
-    section_tokens: dict[str, int] = {}
+    section_tokens: dict[tuple[int, str], int] = {}
+    section_tokens_by_name: dict[str, int] = {}
     section_group: dict[str, int] = {}
     sys_tool_tokens: dict[str, int] = {}
     mcp_tool_tokens: dict[str, int] = {}
@@ -60,6 +116,7 @@ def parse_breakdown_maps(breakdown: Msg | None) -> dict:
     if breakdown is None:
         return {
             "section_tokens": section_tokens,
+            "section_tokens_by_name": section_tokens_by_name,
             "section_group": section_group,
             "sys_tool_tokens": sys_tool_tokens,
             "mcp_tool_tokens": mcp_tool_tokens,
@@ -80,22 +137,30 @@ def parse_breakdown_maps(breakdown: Msg | None) -> dict:
         ):
             for ch in children:
                 cname = ch.str(1)
-                section_tokens[cname] = ch.int(3, signed32=True)
-                section_group[cname] = gtype
+                ctok = max(0, ch.int(3, signed32=True))
+                eff_gtype = (
+                    SYSTEM_PROMPT_SUBGROUPS.get(cname, gtype)
+                    if gtype == TOKEN_SYSTEM_PROMPT
+                    else gtype
+                )
+                section_tokens[(eff_gtype, cname)] = ctok
+                section_tokens_by_name.setdefault(cname, ctok)
+                section_group.setdefault(cname, eff_gtype)
         elif gtype == TOKEN_TOOLS:
             for ch in children:
-                sys_tool_tokens[ch.str(1)] = ch.int(3, signed32=True)
+                sys_tool_tokens[ch.str(1)] = max(0, ch.int(3, signed32=True))
         elif gtype == TOKEN_MCP_TOOLS:
             for ch in children:
-                mcp_tool_tokens[ch.str(1)] = ch.int(3, signed32=True)
+                mcp_tool_tokens[ch.str(1)] = max(0, ch.int(3, signed32=True))
         elif gtype == TOKEN_CHAT_MESSAGES:
             for ch in children:
                 left, sep, right = ch.str(1).partition(": ")
                 if sep and re.fullmatch(r"[+-]?[0-9]+", left):
-                    step_tokens_map[int(left)] = (right, ch.int(3, signed32=True))
+                    step_tokens_map[int(left)] = (right, max(0, ch.int(3, signed32=True)))
 
     return {
         "section_tokens": section_tokens,
+        "section_tokens_by_name": section_tokens_by_name,
         "section_group": section_group,
         "sys_tool_tokens": sys_tool_tokens,
         "mcp_tool_tokens": mcp_tool_tokens,
@@ -112,6 +177,7 @@ def extract_content_items(
     """Extract system prompt sections, tool declarations, and active chat messages."""
     maps = parse_breakdown_maps(breakdown)
     section_tokens = maps["section_tokens"]
+    section_tokens_by_name = maps["section_tokens_by_name"]
     section_group = maps["section_group"]
     sys_tool_tokens = maps["sys_tool_tokens"]
     mcp_tool_tokens = maps["mcp_tool_tokens"]
@@ -127,7 +193,11 @@ def extract_content_items(
             name = sb.str(1) or f"section_{idx}"
             body = sb.str(2)
             gtype = sb.int(6) or section_group.get(name, TOKEN_SYSTEM_PROMPT)
-            tok = section_tokens.get(name, 0)
+            if gtype == TOKEN_SYSTEM_PROMPT and name in SYSTEM_PROMPT_SUBGROUPS:
+                gtype = SYSTEM_PROMPT_SUBGROUPS[name]
+            tok = section_tokens.get((gtype, name))
+            if tok is None:
+                tok = section_tokens_by_name.get(name, 0)
             estimated = False
             if tok <= 0 and body:
                 tok = max(1, len(body.encode("utf-8")) // 4)
@@ -173,10 +243,10 @@ def extract_content_items(
             desc = tb.str(2)
             schema_raw = tb.str(3)
             schema_pretty = schema_raw
-            if schema_raw:
+            if schema_raw and len(schema_raw) <= 100_000:
                 try:
                     schema_pretty = json.dumps(json.loads(schema_raw), indent=2, ensure_ascii=False)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     pass
 
             if name in mcp_tool_tokens:
@@ -199,6 +269,7 @@ def extract_content_items(
                 "order": idx,
                 "name": name,
                 "is_mcp": is_mcp,
+                "mcp_server": extract_mcp_server(name) if is_mcp else "",
                 "group": "MCP tools" if is_mcp else "System tools",
                 "description": desc,
                 "schema": schema_pretty,
@@ -220,7 +291,11 @@ def extract_content_items(
             role = ROLE_MAP.get(role_num, f"role_{role_num}")
             text = mb.str(3)
             thinking = mb.str(11)
-            step_idx = mb.int(18) if mb.has(18) else -1
+            step_idx = (
+                mb.int(18, signed32=True)
+                if mb.has(18)
+                else (0 if idx == 0 and 0 in step_tokens_map else -1)
+            )
             tool_call_id = mb.str(7)
 
             tool_calls = []
@@ -229,10 +304,10 @@ def extract_content_items(
                 tc_name = tc.str(2)
                 tc_args_raw = tc.str(3)
                 tc_args_pretty = tc_args_raw
-                if tc_args_raw:
+                if tc_args_raw and len(tc_args_raw) <= 100_000:
                     try:
                         tc_args_pretty = json.dumps(json.loads(tc_args_raw), indent=2, ensure_ascii=False)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, RecursionError):
                         pass
                 if tc_id and tc_name:
                     call_id_to_name[tc_id] = tc_name

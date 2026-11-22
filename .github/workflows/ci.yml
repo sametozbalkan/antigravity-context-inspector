@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     strategy:
@@ -28,24 +31,54 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Validate JSON manifests
+      - name: Validate JSON manifests & version sync
         shell: python
         run: |
           import json, pathlib
+          manifests = {}
           for p in [
               "plugin.json",
               "sidecars/inspector/sidecar.json",
               "sidecars/inspector/package.json",
           ]:
-              json.loads(pathlib.Path(p).read_text(encoding="utf-8"))
+              manifests[p] = json.loads(pathlib.Path(p).read_text(encoding="utf-8"))
               print("OK:", p)
+          v_plugin = manifests["plugin.json"].get("version")
+          v_pkg = manifests["sidecars/inspector/package.json"].get("version")
+          assert v_plugin and v_plugin == v_pkg, f"Version mismatch: plugin.json={v_plugin!r} vs package.json={v_pkg!r}"
+          print("Version sync OK:", v_plugin)
 
       - name: Check Python syntax & run unit tests
+        shell: bash
         run: |
-          python -m py_compile sidecars/inspector/inspector.py sidecars/inspector/lib/protobuf.py sidecars/inspector/lib/accounting.py sidecars/inspector/lib/content.py
+          python -m py_compile sidecars/inspector/inspector.py sidecars/inspector/lib/protobuf.py sidecars/inspector/lib/accounting.py sidecars/inspector/lib/subagents.py sidecars/inspector/lib/content.py
           python -m unittest discover -s tests -v
 
       - name: Check Node.js & frontend JS syntax
+        shell: bash
         run: |
           node --check sidecars/inspector/main.mjs
           node --check sidecars/inspector/public/app.js
+          node --check sidecars/inspector/public/js/utils.js
+          node --check sidecars/inspector/public/js/sparkline.js
+          node --check sidecars/inspector/public/js/views.js
+
+      - name: Check bash installer syntax
+        shell: bash
+        run: bash -n scripts/install.sh
+
+      - name: Check PowerShell installer syntax
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/install.ps1').Path,
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+          Write-Host 'PowerShell syntax OK: scripts/install.ps1'

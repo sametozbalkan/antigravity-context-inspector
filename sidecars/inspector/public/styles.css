@@ -99,19 +99,6 @@ main {
   white-space: nowrap;
 }
 
-.live {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--track);
-  flex-shrink: 0;
-  transition: background 0.2s;
-}
-.live.on {
-  background: var(--c-ok);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-ok) 18%, transparent);
-}
-
 .icon-btn {
   font: inherit;
   font-size: 11.5px;
@@ -259,6 +246,130 @@ main {
 .seg:first-child { border-radius: 999px 0 0 999px; }
 .seg:last-child { border-radius: 0 999px 999px 0; }
 
+/* Turn-by-turn sparkline */
+.spark-box {
+  margin: 0 0 8px;
+  padding: 4px 0 2px;
+  cursor: crosshair;
+  user-select: none;
+}
+.spark-plot {
+  position: relative;
+  height: 44px;
+  width: 100%;
+}
+.spark-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.spark-line {
+  fill: none;
+  stroke: var(--c-user);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.spark-budget {
+  stroke: var(--c-warn);
+  stroke-width: 1;
+  stroke-opacity: 0.55;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+}
+.spark-budget-lbl {
+  position: absolute;
+  right: 2px;
+  transform: translateY(-105%);
+  font-size: 9.5px;
+  line-height: 1;
+  color: color-mix(in srgb, var(--c-warn) 78%, var(--dim));
+  pointer-events: none;
+}
+.spark-budget-lbl.below {
+  left: 2px;
+  right: auto;
+  transform: translateY(3px);
+}
+.spark-guide {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 1px;
+  background: color-mix(in srgb, var(--dim) 40%, transparent);
+  transform: translateX(-50%);
+  pointer-events: none;
+  display: none;
+}
+.spark-pt {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--c-user) 72%, var(--fg));
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  opacity: 0.78;
+}
+.spark-pt.last {
+  width: 5px;
+  height: 5px;
+  background: var(--c-user);
+  opacity: 1;
+}
+.spark-pt.ck {
+  width: 5.5px;
+  height: 5.5px;
+  background: var(--c-warn);
+  opacity: 1;
+}
+.spark-active-dot {
+  position: absolute;
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  background: var(--c-user);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-user) 26%, transparent);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  display: none;
+}
+.spark-active-dot.ck {
+  background: var(--c-warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-warn) 28%, transparent);
+}
+.spark-tip {
+  min-height: 15px;
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.spark-tip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spark-tip-delta {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.spark-tip-val {
+  color: var(--fg);
+  font-weight: 500;
+}
+
 /* Budget & secondary metrics */
 .metrics {
   display: flex;
@@ -273,8 +384,13 @@ main {
   font-size: 11.5px;
   color: var(--dim);
 }
+.budget-row > span {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 .budget-track {
   flex: 1;
+  min-width: 28px;
   height: 3.5px;
   border-radius: 999px;
   background: var(--track);
@@ -299,6 +415,35 @@ main {
 }
 .sub-meta .sep { opacity: 0.4; }
 .tag-warn { color: var(--c-warn); font-weight: 500; }
+
+.meta-btn {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0 2px;
+  margin: 0 -2px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.meta-btn:hover {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+.meta-btn.tag-warn { color: var(--c-warn); }
+.meta-btn.tag-warn:hover { color: var(--c-warn); }
+
+.session-strip {
+  margin-top: 2px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.4;
+}
 
 /* Sections */
 section {
@@ -336,7 +481,7 @@ section {
 
 .row {
   display: grid;
-  grid-template-columns: 10px 1fr auto 44px 12px;
+  grid-template-columns: 10px 1fr auto minmax(44px, auto) 12px;
   align-items: center;
   gap: 8px;
   padding: 5px 6px;
@@ -431,6 +576,46 @@ section {
   white-space: nowrap;
 }
 
+/* MCP server groups */
+.mcp-srv-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto 10px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.1s;
+}
+.mcp-srv-row:hover { background: var(--surface-hover); }
+.mcp-srv-row.open { background: var(--surface); }
+.mcp-srv-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--fg);
+}
+.mcp-srv-count {
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.mcp-srv-row.open .chev {
+  transform: rotate(90deg);
+  opacity: 1;
+}
+.mcp-srv-tools {
+  margin: 2px 0 4px 10px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 /* Inline content peek */
 .peek {
   margin: 2px 0 6px;
@@ -443,10 +628,18 @@ section {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 4px 8px;
   border-bottom: 1px solid var(--line);
   font-size: 11px;
   color: var(--dim);
+}
+.peek-err {
+  color: var(--c-danger);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .peek pre {
   margin: 0;
@@ -475,7 +668,7 @@ section {
 /* Subagents */
 .sub-row {
   display: grid;
-  grid-template-columns: 10px 1fr auto 42px 12px;
+  grid-template-columns: 10px 1fr auto minmax(42px, auto) 12px;
   align-items: center;
   gap: 8px;
   padding: 6px 6px;
@@ -485,6 +678,7 @@ section {
   transition: background 0.12s;
 }
 .sub-row:hover { background: var(--surface-hover); }
+.sub-row.muted { opacity: 0.62; }
 .sub-dot {
   width: 6px;
   height: 6px;
@@ -494,17 +688,33 @@ section {
 }
 .sub-dot.running {
   background: var(--c-ok);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-ok) 22%, transparent);
+  animation: sub-pulse 2.2s ease-in-out infinite;
 }
 .sub-info { min-width: 0; }
 .sub-role {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12.5px;
   font-weight: 500;
   color: var(--fg);
+  min-width: 0;
+}
+.sub-role-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.badge-swarm {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--c-custom);
+  background: color-mix(in srgb, var(--c-custom) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c-custom) 32%, transparent);
+  border-radius: 999px;
+  padding: 0 5px;
 }
 .sub-meta-line {
   display: block;
@@ -566,6 +776,90 @@ section {
   font-size: 11.5px;
   color: var(--dim);
   white-space: nowrap;
+}
+
+/* Settings popover */
+.settings-box {
+  margin-top: 14px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 8px;
+  font-size: 11.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 500;
+  color: var(--fg);
+}
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  row-gap: 4px;
+  color: var(--dim);
+}
+.seg-ctrl {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.seg-opt {
+  font: inherit;
+  font-size: 11px;
+  color: var(--dim);
+  background: transparent;
+  border: none;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.seg-opt + .seg-opt {
+  border-left: 1px solid var(--line);
+}
+.seg-opt:hover {
+  color: var(--fg);
+  background: var(--surface-hover);
+}
+.seg-opt.active {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--c-user) 16%, transparent);
+  font-weight: 500;
+}
+
+.foot-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.gear-btn {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dim);
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  padding: 2px 4px;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+.gear-btn:hover {
+  color: var(--fg);
+  background: var(--surface-hover);
+}
+.gear-btn.active {
+  color: var(--c-user);
+  background: color-mix(in srgb, var(--c-user) 12%, transparent);
 }
 
 /* Update drawer & badge */
@@ -636,7 +930,9 @@ footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 4px;
   font-size: 11px;
   color: var(--dim);
 }
@@ -644,4 +940,55 @@ footer {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+/* Transitions & subtle micro-animations */
+@keyframes view-fwd {
+  from { opacity: 0; transform: translateX(14px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes view-back {
+  from { opacity: 0; transform: translateX(-14px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes view-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes micro-expand {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes micro-pop {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes sub-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--c-ok) 24%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--c-ok) 8%, transparent); }
+}
+
+.view-stage.anim-forward {
+  animation: view-fwd 170ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.view-stage.anim-back {
+  animation: view-back 170ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.view-stage.anim-switch {
+  animation: view-fade 140ms ease-out;
+}
+.anim-expand {
+  animation: micro-expand 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.anim-pop {
+  animation: micro-pop 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-stage,
+  .anim-expand,
+  .anim-pop,
+  .sub-dot.running {
+    animation: none !important;
+  }
 }

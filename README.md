@@ -20,18 +20,26 @@
 </p>
 
 <p align="center">
-  <img src="docs/img/preview.png" alt="Context Inspector in Dark Mode and Light Mode with subagent drill-down" width="860" />
+  <img src="docs/img/preview.png" alt="Context Inspector in Dark Mode and Light Mode with Sparkline, MCP Server Breakdown, Swarm Workers, and Settings" width="860" />
 </p>
+
+<details align="center">
+  <summary><strong>Watch interactive walkthrough (Sparkline · MCP Servers · Settings · Swarm)</strong></summary>
+  <br />
+  <img src="docs/img/demo.gif" alt="Interactive walkthrough of Context Inspector v1.1.0" width="440" />
+</details>
 
 ---
 
 ## Highlights
 
 - **Exact token accounting — not character guesses.** Reads the actual `ContextWindowMetadata` breakdown and prompt payload stored in `~/.gemini/antigravity/conversations/<id>.db` (read-only), paired with live model limits from Antigravity’s model catalog. Zero extra LLM tokens consumed.
-- **Native window &amp; request trim budget.** Shows both the model’s native context capacity (e.g. `1M`) and Antigravity’s per-request compaction/trim budget (e.g. `512k`, `256k`, or `128k`), plus live prompt cache hit rate.
-- **Minimalist single-page overview with inline content peek.** Clean by default — click any category (`System prompt`, `System tools`, `MCP tools`, `Skills`, `User messages`, `Agent responses`, `Tool calls`) to reveal individual items ranked by token cost, and click any item to inspect or copy its exact content sent to the model.
-- **Subagent context monitoring.** Automatically detects spawned subagents, displays their live status and token usage, and lets you drill into any subagent’s full context overview (with `← Main` navigation and `Open ↗` to jump to its chat).
-- **Safe two-step `/compact` action.** Automatically surfaces a subtle `Compact` button once context reaches **60%** of the active budget (`Confirm` → sends `/compact` to the conversation, with clipboard fallback if unavailable).
+- **Turn-by-turn growth sparkline.** Crisp 44px SVG sparkline right below the context bar shows token growth across turns with per-turn markers, compaction drops, labeled budget thresholds, and effortless full-card hover telemetry.
+- **Native window &amp; request trim budget.** Shows both the model’s native context capacity (e.g. `1M`) and Antigravity’s per-request compaction/trim budget (e.g. `512k`, `256k`, or `128k`) — switchable as the primary meter via `⚙` Settings.
+- **Prompt cache drop alert &amp; session summary.** Flags unexpected prompt cache drops (`Cache 18% ↓`) in amber when caching was previously active, and expands a 1-line session summary (`turns · avg cache · total out · thinking`) on click.
+- **Minimalist single-page overview with MCP server breakdown &amp; inline peek.** Click any category to rank items by token cost, drill into **MCP servers** (`github`, `supabase`, …) before inspecting individual tool schemas, and peek or copy exact payloads sent to the model.
+- **Subagent &amp; Swarm Worker monitoring.** Automatically detects both `invoke_subagent` subagents and **Swarm workers** (`members.json`), displaying live status, token usage, and full `← Main` / `Open ↗` drill-down.
+- **Configurable `/compact` control &amp; persisted `⚙` settings.** Configure compact threshold (`50%`, `60%`, `75%`, `Off`), primary meter (`Native` / `Budget`), and compact action (`Send /compact` with two-step confirmation or 1-click `Copy only`) — persisted outside iframe storage in `settings.json`.
 - **Native Dark &amp; Light mode.** Syncs automatically with Antigravity’s live theme variables via the sidecar preload bridge.
 - **Zero external dependencies.** Uses only Python 3 standard library and Antigravity’s bundled Node.js runtime — no `npm install`, no `pip install`, no build step.
 
@@ -114,16 +122,21 @@ antigravity-context-inspector/
 ├── sidecars/inspector/
 │   ├── sidecar.json                   # Registers AUX_PANE side panel
 │   ├── package.json
-│   ├── main.mjs                       # Sidecar HTTP server, model catalog, LRU cache, update check
+│   ├── main.mjs                       # Sidecar HTTP server, mtime-cached static assets, model catalog, LRU cache, update check
 │   ├── inspector.py                   # CLI entrypoint & snapshot assembler
 │   ├── lib/
 │   │   ├── protobuf.py                # Minimal wire decoder (stdlib only)
-│   │   ├── accounting.py              # Token breakdown, checkpoints, files, subagent discovery
+│   │   ├── accounting.py              # Token breakdown, checkpoints, file detection
+│   │   ├── subagents.py               # Subagent & Swarm worker discovery and stats
 │   │   └── content.py                 # System sections, tool schemas, active messages
 │   └── public/
-│       ├── index.html                 # HTML shell
+│       ├── index.html                 # HTML shell (loads classic /app.js)
 │       ├── styles.css                 # Theme-aware minimalist CSS
-│       └── app.js                     # Panel UI, inline peek, subagent nav, /compact control
+│       ├── app.js                     # Panel state, API polling, delegated click handling
+│       └── js/
+│           ├── utils.js               # Formatting, escaping, clipboard & path helpers
+│           ├── sparkline.js           # Turn-by-turn SVG sparkline & hover telemetry
+│           └── views.js               # Pure HTML template renderers
 └── tests/
     └── test_inspector.py              # End-to-end synthetic SQLite tests (unittest)
 ```
