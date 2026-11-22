@@ -16,11 +16,11 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
+import { buildSnapshot } from './lib/snapshot.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = resolve(HERE, '..', '..');
 const PUBLIC_DIR = join(HERE, 'public');
-const SCRIPT = join(HERE, 'inspector.py');
 const GEMINI_DIR = process.env.ANTIGRAVITY_GEMINI_DIR || join(homedir(), '.gemini');
 const CONVERSATIONS_DIR = join(GEMINI_DIR, 'antigravity', 'conversations');
 const BRAIN_DIR = join(GEMINI_DIR, 'antigravity', 'brain');
@@ -51,21 +51,6 @@ const app = new SidecarApp();
 
 // --- Subprocess, filesystem & HTTP helpers -----------------------------------
 
-const PYTHON_CANDIDATES = process.platform === 'win32'
-  ? [['python', []], ['py', ['-3']], ['python3', []]]
-  : process.platform === 'darwin'
-    ? [
-        ['/opt/homebrew/bin/python3', []],
-        ['/usr/local/bin/python3', []],
-        ['/Library/Frameworks/Python.framework/Versions/Current/bin/python3', []],
-        ['python3', []],
-        ['python', []],
-      ]
-    : [['python3', []], ['python', []]];
-
-let resolvedPython = null;
-let pythonInFlight = null;
-
 function writeFileAtomic(targetPath, content) {
   mkdirSync(dirname(targetPath), { recursive: true });
   const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`;
@@ -83,7 +68,7 @@ function writeFileAtomic(targetPath, content) {
 }
 
 function execAsync(cmd, args, { timeout = 25000, cwd = undefined, extraEnv = undefined } = {}) {
-  const env = { ...process.env, PYTHONIOENCODING: 'utf-8', ...(extraEnv || {}) };
+  const env = { ...process.env, ...(extraEnv || {}) };
   delete env.ANTIGRAVITY_CSRF_TOKEN;
   delete env.ANTIGRAVITY_LS_ADDRESS;
   return new Promise((resolvePromise, reject) => {
@@ -103,29 +88,6 @@ function execAsync(cmd, args, { timeout = 25000, cwd = undefined, extraEnv = und
       },
     );
   });
-}
-
-async function findPython() {
-  if (resolvedPython) return resolvedPython;
-  if (pythonInFlight) return pythonInFlight;
-  pythonInFlight = (async () => {
-    for (const [cmd, pre] of PYTHON_CANDIDATES) {
-      if (cmd.startsWith('/') && !existsSync(cmd)) continue;
-      try {
-        const out = await execAsync(cmd, [...pre, '--version'], { timeout: 5000 });
-        if (/^Python 3\./.test(out.trim())) {
-          resolvedPython = { cmd, pre };
-          return resolvedPython;
-        }
-      } catch {
-        // try next candidate
-      }
-    }
-    throw new Error('Python 3 not found on PATH.');
-  })().finally(() => {
-    pythonInFlight = null;
-  });
-  return pythonInFlight;
 }
 
 function readJsonResponse(req, res, prefix, resolvePromise, reject) {
@@ -524,13 +486,7 @@ async function getSnapshotEntry(conversationId, workspaceUri) {
   const preSubStamp = cached ? subagentStamps(cached.subIds) : null;
 
   const task = (async () => {
-    const { cmd, pre } = await findPython();
-    const args = [...pre, SCRIPT, '--db', db, '--json'];
-    if (existsSync(CATALOG_PATH)) args.push('--model-catalog', CATALOG_PATH);
-    if (ws) args.push(`--workspace=${ws}`);
-
-    const stdout = await execAsync(cmd, args);
-    const snapshot = JSON.parse(stdout);
+    const snapshot = buildSnapshot(db, ws || null, existsSync(CATALOG_PATH) ? CATALOG_PATH : null);
     const updatedAt = new Date().toISOString();
     const subIds = (snapshot.summary.subagents || []).map((sa) => sa.conversation_id);
     const postSubStamp = subagentStamps(subIds);

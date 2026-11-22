@@ -21,47 +21,53 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.13'
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '24'
 
       - name: Validate JSON manifests & version sync
-        shell: python
+        shell: bash
         run: |
-          import json, pathlib
-          manifests = {}
-          for p in [
+          node -e '
+            const fs = require("node:fs");
+            const files = [
               "plugin.json",
               "sidecars/inspector/sidecar.json",
               "sidecars/inspector/package.json",
-          ]:
-              manifests[p] = json.loads(pathlib.Path(p).read_text(encoding="utf-8"))
-              print("OK:", p)
-          v_plugin = manifests["plugin.json"].get("version")
-          v_pkg = manifests["sidecars/inspector/package.json"].get("version")
-          assert v_plugin and v_plugin == v_pkg, f"Version mismatch: plugin.json={v_plugin!r} vs package.json={v_pkg!r}"
-          print("Version sync OK:", v_plugin)
-
-      - name: Check Python syntax & run unit tests
-        shell: bash
-        run: |
-          python -m py_compile sidecars/inspector/inspector.py sidecars/inspector/lib/protobuf.py sidecars/inspector/lib/accounting.py sidecars/inspector/lib/subagents.py sidecars/inspector/lib/content.py
-          python -m unittest discover -s tests -v
+            ];
+            const manifests = {};
+            for (const p of files) {
+              manifests[p] = JSON.parse(fs.readFileSync(p, "utf8"));
+              console.log("OK:", p);
+            }
+            const vPlugin = manifests["plugin.json"].version;
+            const vPkg = manifests["sidecars/inspector/package.json"].version;
+            if (!vPlugin || vPlugin !== vPkg) {
+              throw new Error(`Version mismatch: plugin.json=${JSON.stringify(vPlugin)} vs package.json=${JSON.stringify(vPkg)}`);
+            }
+            console.log("Version sync OK:", vPlugin);
+          '
 
       - name: Check Node.js & frontend JS syntax
         shell: bash
         run: |
           node --check sidecars/inspector/main.mjs
+          node --check sidecars/inspector/inspector.mjs
+          node --check sidecars/inspector/lib/protobuf.mjs
+          node --check sidecars/inspector/lib/accounting.mjs
+          node --check sidecars/inspector/lib/subagents.mjs
+          node --check sidecars/inspector/lib/content.mjs
+          node --check sidecars/inspector/lib/snapshot.mjs
           node --check sidecars/inspector/public/app.js
           node --check sidecars/inspector/public/js/utils.js
           node --check sidecars/inspector/public/js/sparkline.js
           node --check sidecars/inspector/public/js/views.js
+          for f in tests/*.mjs; do node --check "$f"; done
+
+      - name: Run unit tests
+        shell: bash
+        run: node --test tests/*.test.mjs
 
       - name: Check bash installer syntax
         shell: bash

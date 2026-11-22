@@ -41,14 +41,13 @@
 - **Subagent &amp; Swarm Worker monitoring.** Automatically detects both `invoke_subagent` subagents and **Swarm workers** (`members.json`), displaying live status, token usage, and full `← Main` / `Open ↗` drill-down.
 - **Configurable `/compact` control &amp; persisted `⚙` settings.** Configure compact threshold (`50%`, `60%`, `75%`, `Off`), primary meter (`Native` / `Budget`), and compact action (`Send /compact` with two-step confirmation or 1-click `Copy only`) — persisted outside iframe storage in `settings.json`.
 - **Native Dark &amp; Light mode.** Syncs automatically with Antigravity’s live theme variables via the sidecar preload bridge.
-- **Zero external dependencies.** Uses only Python 3 standard library and Antigravity’s bundled Node.js runtime — no `npm install`, no `pip install`, no build step.
+- **Zero external dependencies.** Runs entirely on Antigravity’s bundled Node.js runtime using built-in modules (`node:sqlite`, `node:crypto`, `node:fs`) — no Python required, no `npm install`, no build step.
 
 ---
 
 ## Requirements
 
-- **Antigravity 2.0 Desktop**
-- **Python 3** available on your `PATH` (`python`, `py`, or `python3`)
+- **Antigravity 2.0 Desktop** (no Python or external runtime needed)
 
 ---
 
@@ -122,13 +121,14 @@ antigravity-context-inspector/
 ├── sidecars/inspector/
 │   ├── sidecar.json                   # Registers AUX_PANE side panel
 │   ├── package.json
-│   ├── main.mjs                       # Sidecar HTTP server, mtime-cached static assets, model catalog, LRU cache, update check
-│   ├── inspector.py                   # CLI entrypoint & snapshot assembler
+│   ├── main.mjs                       # Sidecar HTTP server, in-process snapshot cache, mtime-cached static assets, model catalog, update check
+│   ├── inspector.mjs                  # Standalone Node.js CLI entrypoint
 │   ├── lib/
-│   │   ├── protobuf.py                # Minimal wire decoder (stdlib only)
-│   │   ├── accounting.py              # Token breakdown, checkpoints, file detection
-│   │   ├── subagents.py               # Subagent & Swarm worker discovery and stats
-│   │   └── content.py                 # System sections, tool schemas, active messages
+│   │   ├── protobuf.mjs               # Minimal zero-copy wire decoder (BigInt + Uint8Array.subarray)
+│   │   ├── accounting.mjs             # Read-only node:sqlite loader, token breakdown, checkpoints, file detection
+│   │   ├── subagents.mjs              # Subagent & Swarm worker discovery and stats
+│   │   ├── content.mjs                # System sections, tool schemas, active messages
+│   │   └── snapshot.mjs               # Snapshot assembler, CLI text formatter & SHA-1 fingerprinting
 │   └── public/
 │       ├── index.html                 # HTML shell (loads classic /app.js)
 │       ├── styles.css                 # Theme-aware minimalist CSS
@@ -138,36 +138,37 @@ antigravity-context-inspector/
 │           ├── sparkline.js           # Turn-by-turn SVG sparkline & hover telemetry
 │           └── views.js               # Pure HTML template renderers
 └── tests/
-    └── test_inspector.py              # End-to-end synthetic SQLite tests (unittest)
+    ├── helpers.mjs                    # Shared synthetic protobuf & SQLite test builders
+    └── *.test.mjs                     # Modular node:test suites (protobuf, accounting, subagents, content, CLI, frontend)
 ```
 
 ### How it works
 
 1. The panel receives the active conversation ID and workspace URIs from Antigravity’s `/preload.js` bridge and polls `/api/report` every 3 seconds while visible.
-2. `main.mjs` fingerprints the conversation’s `.db` and `-wal` files (plus any discovered subagent databases) and only invokes `inspector.py --json` when something actually changed.
-3. All database connections open strictly read-only (`?mode=ro`). Full item payloads are served instantly from the backend’s in-memory LRU cache via `/api/item` when you click to inspect a row.
+2. `main.mjs` fingerprints the conversation’s `.db` and `-wal` files (plus Swarm `members.json` and any discovered subagent databases) and only invokes `buildSnapshot()` in-process when something actually changed.
+3. All database connections open strictly read-only via Node’s built-in `node:sqlite` (`DatabaseSync` with `{ readOnly: true }`). Full item payloads are served instantly from the backend’s in-memory LRU cache via `/api/item` when you click to inspect a row.
 
 ---
 
 ## CLI Usage & Testing
 
-The Python parser also works standalone from the command line:
+The Node.js parser also works standalone from the command line (Node.js 22.5+ / 24+):
 
 ```bash
 # Latest Antigravity Desktop conversation
-python sidecars/inspector/inspector.py
+node sidecars/inspector/inspector.mjs
 
 # Specific conversation ID as structured JSON
-python sidecars/inspector/inspector.py --conversation-id <uuid> --json
+node sidecars/inspector/inspector.mjs --conversation-id <uuid> --json
 
 # Arbitrary SQLite conversation database
-python sidecars/inspector/inspector.py --db /path/to/<uuid>.db
+node sidecars/inspector/inspector.mjs --db /path/to/<uuid>.db
 ```
 
 Run the zero-dependency test suite:
 
 ```bash
-python -m unittest discover -s tests -v
+node --test tests/*.test.mjs
 ```
 
 ---

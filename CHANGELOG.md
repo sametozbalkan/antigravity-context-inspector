@@ -2,6 +2,15 @@
 
 All notable changes to **Antigravity Context Inspector** are documented in this file.
 
+## [1.2.0] - 2026-11-23
+
+### Changed
+- **Pure Node.js (`node:sqlite`) single-runtime migration:** Eliminated the Python 3 dependency completely. Context Inspector now runs 100% on Antigravity Desktop’s bundled Node.js runtime using built-in modules (`node:sqlite`, `node:crypto`, `node:fs`, `node:util`) with zero external dependencies.
+- **Direct in-process parsing (~8x faster):** `sidecars/inspector/main.mjs` now calls `buildSnapshot()` directly in-process instead of spawning a Python subprocess and JSON-parsing stdout on every cache miss, while preserving LRU caching, in-flight deduplication, `subStamp` TOCTOU guards, and read-only SQLite transactions (`DatabaseSync({ readOnly: true })` + `BEGIN`/`ROLLBACK` + `stmt.iterate()`).
+- **Zero-copy Node.js protobuf wire decoder (`lib/protobuf.mjs`):** Ported schema-less wire decoding to `BigInt` varints (with 10-byte overflow guards) and `Uint8Array.subarray` zero-copy slices across `lib/{protobuf,accounting,subagents,content,snapshot}.mjs` with 100% output parity.
+- **Standalone Node.js CLI & modular `node:test` suite (33 tests):** Replaced the Python CLI and `unittest` suite with `sidecars/inspector/inspector.mjs` (`node sidecars/inspector/inspector.mjs`) and modular `tests/*.test.mjs` suites (`protobuf`, `accounting`, `subagents`, `content`, `snapshot_cli`, plus 10 new zero-dependency `frontend_utils` tests).
+- **Node-only CI:** Streamlined `.github/workflows/ci.yml` to run solely on Node.js 24 across Ubuntu, macOS, and Windows (manifest JSON & version sync validation, `node --check` on all ESM/browser modules, `node --test`, and shell/PowerShell installer syntax checks).
+
 ## [1.1.0] - 2026-11-22
 
 ### Added

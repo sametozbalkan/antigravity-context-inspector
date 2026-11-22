@@ -7,11 +7,10 @@ Guidance for AI coding agents working in this repository.
 **Antigravity Context Inspector** is a minimalist live Context Window & Subagent Inspector side panel (`AUX_PANE`) plugin for **Antigravity 2.0 Desktop**.
 
 ### Hard Constraints
-- **Zero external dependencies.** No `npm install`, no `pip install`, no bundler/build step.
-  - Backend: Antigravity's bundled Node.js runtime (ESM) + host-provided `sidecar_sdk`.
-  - Parser: Python 3 standard library only (`sqlite3`, `json`, `re`, `hashlib`, `urllib.parse`, `argparse`, `pathlib`).
+- **Zero external dependencies.** No `npm install`, no Python requirement, no bundler/build step.
+  - Backend & Parser: Antigravity's bundled Node.js runtime (ESM, Node 22.5+ / 24+) using built-ins (`node:sqlite`, `node:crypto`, `node:fs`, `node:http`, `node:https`, `node:util`, `node:child_process`) + host-provided `sidecar_sdk`.
   - Frontend: Vanilla HTML, CSS, and JS served directly from `sidecars/inspector/public/`.
-- **Strictly read-only DB access.** Never open Antigravity conversation SQLite databases in read-write mode. Always use `sqlite_ro_uri()` (`?mode=ro` with percent-encoded paths).
+- **Strictly read-only DB access.** Never open Antigravity conversation SQLite databases in read-write mode. Always use `openSqliteReadOnly()` (`new DatabaseSync(dbPath, { readOnly: true, timeout })` inside `BEGIN`/`ROLLBACK`).
 - **Zero extra LLM token cost.** All accounting comes from existing local SQLite conversation records and Language Server metadata.
 
 ---
@@ -28,13 +27,14 @@ Guidance for AI coding agents working in this repository.
 ├── sidecars/inspector/
 │   ├── sidecar.json                    # Registers AUX_PANE web UI sidecar (`node main.mjs`)
 │   ├── package.json                    # ESM marker ("type": "module") & sidecar version
-│   ├── main.mjs                        # Sidecar HTTP server, mtime-cached static assets, LS model catalog, LRU & in-flight cache, update check
-│   ├── inspector.py                    # CLI entrypoint & JSON snapshot assembler
+│   ├── main.mjs                        # Sidecar HTTP server, in-process snapshot cache, mtime-cached static assets, LS model catalog, update check
+│   ├── inspector.mjs                   # Standalone CLI entrypoint (`node sidecars/inspector/inspector.mjs`)
 │   ├── lib/
-│   │   ├── protobuf.py                 # Minimal wire-level protobuf decoder (`Msg`, varints)
-│   │   ├── accounting.py               # Token accounting, step rehydration, compaction, file detection
-│   │   ├── subagents.py                # Subagent (`invoke_subagent`) & Swarm worker discovery and stats
-│   │   └── content.py                  # System sections, tool schemas, active messages for inline peek
+│   │   ├── protobuf.mjs                # Minimal zero-copy wire-level protobuf decoder (`Msg`, `BigInt` varints, `Uint8Array.subarray`)
+│   │   ├── accounting.mjs              # Read-only `node:sqlite` loader, token accounting, step rehydration, compaction, file detection
+│   │   ├── subagents.mjs               # Subagent (`invoke_subagent`) & Swarm worker discovery and stats
+│   │   ├── content.mjs                 # System sections, tool schemas, active messages for inline peek
+│   │   └── snapshot.mjs                # Snapshot assembler (`buildSnapshot`), CLI formatter, SHA-1 fingerprinting
 │   └── public/
 │       ├── index.html                  # Loads `/preload.js`, `/styles.css`, and classic `/app.js`
 │       ├── styles.css                  # Native Antigravity dark/light theme-aware styling
@@ -44,8 +44,14 @@ Guidance for AI coding agents working in this repository.
 │           ├── sparkline.js            # Turn-by-turn SVG sparkline renderer & hover interaction
 │           └── views.js                # Pure HTML template renderers (peek, categories, MCP, subagents, settings, update drawer)
 ├── tests/
-│   └── test_inspector.py               # End-to-end synthetic SQLite + protobuf unittest suite
-└── .github/workflows/ci.yml            # Cross-platform CI (Ubuntu, macOS, Windows; Python 3.13, Node 24)
+│   ├── helpers.mjs                     # Shared synthetic protobuf/SQLite test builders
+│   ├── protobuf.test.mjs               # Wire-level protobuf & varint tests
+│   ├── accounting.test.mjs             # Token breakdown, compaction, history & cache drop tests
+│   ├── subagents.test.mjs              # Subagent rehydration, quickSubagentStats & Swarm tests
+│   ├── content.test.mjs                # Subgroups, MCP server grouping, preview & malformed input tests
+│   ├── snapshot_cli.test.mjs           # Fingerprinting, URI/path edge cases & CLI tests
+│   └── frontend_utils.test.mjs         # Zero-dep `node:vm` tests for `public/js/{utils,sparkline,views}.js`
+└── .github/workflows/ci.yml            # Cross-platform CI (Ubuntu, macOS, Windows; Node 24)
 ```
 
 ---
@@ -62,22 +68,22 @@ Guidance for AI coding agents working in this repository.
    - Serves static panel assets (`/`, `/styles.css`, and `/app.js` assembled from `public/js/{utils,sparkline,views}.js` + `public/app.js` inside a private IIFE) via `mtime`-validated in-memory cache (`staticAssetCache`). Classic `<script src="/app.js">` avoids CORS/origin/subpath restrictions in Antigravity's sandboxed sidecar webview.
    - Reads `~/.gemini/antigravity/conversations/<uuid>.db` (configurable via `ANTIGRAVITY_GEMINI_DIR`).
    - Fingerprints `db` + `db-wal` + Swarm `members.json` + workspace + `model-catalog.json` (`baseKey`) plus discovered subagent/worker DB stamps (`subStamp`).
-   - Only spawns `python inspector.py --db <path> --json` on cache miss.
-   - Maintains a 12-conversation LRU `snapshotCache` and deduplicates concurrent parses via `snapshotInFlight` (`conversationId|baseKey`).
+   - Calls `buildSnapshot(db, ws || null, existsSync(CATALOG_PATH) ? CATALOG_PATH : null)` directly in-process on cache miss (no Python subprocess).
+   - Maintains a 12-conversation LRU `snapshotCache`, deduplicates concurrent parses via `snapshotInFlight` (`conversationId|baseKey`), and guards against stale writes via `snapshotSeq` and `subStamp` TOCTOU checks.
    - Persists UI preferences to `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/settings.json` with strict value sanitization (`GET /api/settings`, `POST /api/settings/save`).
    - Fetches live model limits (`maxTokens`, `displayName`) from Antigravity's Language Server (`GetAvailableModels` via `ANTIGRAVITY_LS_ADDRESS` + `ANTIGRAVITY_CSRF_TOKEN`), cached to `model-catalog.json` (10 min TTL, 60s retry cooldown on failure, single in-flight request).
    - Checks GitHub Releases every 12h (`/api/update-status`) and supports explicit user-triggered `git pull --ff-only` (`POST /api/update`).
-3. **Parser (`inspector.py` + `lib/`)**:
-   - `load_db_with_history()` performs a single streaming read-only pass (`BEGIN`/`ROLLBACK`) over `steps` and `gen_metadata`, using zero-copy `iter_fields()` (`lib/protobuf.py`) to extract per-turn sparkline `history` (last 120 turns) and weighted `session_usage` while retaining only the latest `latest_stats` and `latest_content` byte blobs before decoding.
-   - `extract_subagents()` in `lib/subagents.py` discovers both `invoke_subagent` subagents (`source: "subagent"`) and Swarm workers (`source: "swarm"`) from `<appData>/brain/<convId>/.system_generated/swarm/members.json`.
-   - `extract_mcp_server()` in `lib/content.py` infers `mcp_server` (`mcp_<server>_<tool>`, `<server>__<tool>`, `server:tool`, `server/tool`, fallback `other`) for MCP server-level breakdown in the UI.
-   - Emits `{ summary, content }`; `main.mjs` strips heavy content bodies into `lightReport.index` for `/api/report` and serves full items from cache on `/api/item`.
+3. **Parser (`lib/` + `inspector.mjs`)**:
+   - `loadDbWithHistory()` (`lib/accounting.mjs`) opens SQLite via `DatabaseSync({ readOnly: true })` and performs a single streaming read-only pass (`BEGIN`/`ROLLBACK` + `stmt.iterate()`) over `steps` and `gen_metadata`, using zero-copy `iterFields()` (`lib/protobuf.mjs` — `BigInt` varints and `Uint8Array.subarray`) to extract per-turn sparkline `history` (last 120 turns) and weighted `sessionUsage` while retaining only the latest `latestStatsBytes` and `latestContentBytes` blobs before decoding.
+   - `extractSubagents()` in `lib/subagents.mjs` discovers both `invoke_subagent` subagents (`source: "subagent"`) and Swarm workers (`source: "swarm"`) from `<appData>/brain/<convId>/.system_generated/swarm/members.json`.
+   - `extractMcpServer()` in `lib/content.mjs` infers `mcp_server` (`mcp_<server>_<tool>`, `<server>__<tool>`, `server:tool`, `server/tool`, fallback `other`) for MCP server-level breakdown in the UI.
+   - `buildSnapshot()` (`lib/snapshot.mjs`) emits `{ summary, content }`; `main.mjs` strips heavy content bodies into `lightReport.index` for `/api/report` and serves full items from cache on `/api/item`.
 
 ---
 
 ## Protobuf & Accounting Invariants
 
-All protobuf decoding is schema-less wire decoding via `Msg` in `lib/protobuf.py`. Keep field numbers exact:
+All protobuf decoding is schema-less wire decoding via `Msg` and `iterFields()` in `lib/protobuf.mjs` using `BigInt` varints (with 10-byte overflow guards) and `Uint8Array.subarray` zero-copy slices. Keep field numbers exact:
 
 - **`gen_metadata.data` (`GenMetadata`)**:
   - `[1]` `chat` (`Chat` / generation request+response)
@@ -90,15 +96,15 @@ All protobuf decoding is schema-less wire decoding via `Msg` in `lib/protobuf.py
     - `[19]` / `[11]` model ID; `[21]` model display name
 - **`ContextWindowMetadata.breakdown`**:
   - `[1]` repeated groups: `[1]` name, `[2]` group type (`TOKEN_*`), `[4]` total tokens (signed32), `[5]` repeated children (`[1]` name, `[3]` tokens signed32).
-  - **`SYSTEM_PROMPT_SUBGROUPS` invariant**: Antigravity may nest `flows`, `skills`, and `subagents` inside `TOKEN_SYSTEM_PROMPT (1)`. Both `accounting.py` (category totals) and `content.py` (`parse_breakdown_maps` + `extract_content_items`) must map them via the shared `SYSTEM_PROMPT_SUBGROUPS` dict (`flows -> TOKEN_FLOWS (10)`, `skills -> TOKEN_SKILLS (5)`, `subagents -> TOKEN_SUBAGENTS (6)`) so category rows and expandable drill-down items stay aligned.
+  - **`SYSTEM_PROMPT_SUBGROUPS` invariant**: Antigravity may nest `flows`, `skills`, and `subagents` inside `TOKEN_SYSTEM_PROMPT (1)`. Both `accounting.mjs` (category totals) and `content.mjs` (`parseBreakdownMaps` + `extractContentItems`) must map them via the shared `SYSTEM_PROMPT_SUBGROUPS` dict (`flows -> TOKEN_FLOWS (10)`, `skills -> TOKEN_SKILLS (5)`, `subagents -> TOKEN_SUBAGENTS (6)`) so category rows and expandable drill-down items stay aligned.
 - **`steps` table & Rehydration**:
   - Generic tool steps (`step_type = 132`, payload field `140`) may wrap an original step in `__original_cortex_step` (`type_url` ending `/gemini_coder.Step`).
-  - `Step._rehydrate()` **must** preserve `self.generic_result_text` before replacing `self.pb` so `extract_subagents()` can still read spawned `conversationId` values from rehydrated `INVOKE_SUBAGENT (127)` steps. `_extract_subagent_id()` also falls back to scanning non-metadata payload fields for native `step_type = 127` steps.
+  - `Step._rehydrate()` **must** preserve `this.genericResultText` before replacing `this.pb` so `extractSubagents()` can still read spawned `conversationId` values from rehydrated `INVOKE_SUBAGENT (127)` steps. `extractSubagentId()` also falls back to scanning non-metadata payload fields for native `step_type = 127` steps.
 - **Compaction / Checkpoints**:
   - A completed `CHECKPOINT` step (`step_type = 23`, `status = 3`, payload field `30`) with `ck.index > chat_start.active_checkpoint` overrides pre-checkpoint chat token counts with post-checkpoint steps + checkpoint summary tokens.
-  - `quick_subagent_stats()` reads up to 5 non-null `gen_metadata` rows and performs a targeted query for the latest completed `step_type = 23` step, loading post-checkpoint steps only when compaction occurred.
-- **Snapshot `fingerprint` (`inspector.py`)**:
-  - Hashes `used_tokens`, `limit_tokens`, `request_budget_tokens`, `model`, `has_breakdown`, `compacted`, `checkpoint_buffer`, `checkpoints`, category `(key, tokens)` pairs, `api_usage`, `history` length + latest token count, `session_usage`, `counts`, `len(steps)`, `active_checkpoint`, file lists (`system_files`, `skill_files`, `artifact_files`, `knowledge_files`), and subagent/worker tuples (`conversation_id`, `role`, `model`, `used_tokens`, `limit_tokens`, `request_budget_tokens`, `status`, `swarm_state`, `source`). Update this if you add new top-level summary fields rendered in the panel.
+  - `quickSubagentStats()` opens each subagent DB read-only (`DatabaseSync({ readOnly: true })` inside `BEGIN`/`ROLLBACK`), reads up to 5 non-null `gen_metadata` rows, and performs a targeted query for the latest completed `step_type = 23` step, loading post-checkpoint steps only when compaction occurred.
+- **Snapshot `fingerprint` (`lib/snapshot.mjs`)**:
+  - Hashes `used_tokens`, `limit_tokens`, `request_budget_tokens`, `model`, `has_breakdown`, `compacted`, `checkpoint_buffer`, `checkpoints`, category `(key, tokens)` pairs, `api_usage`, `history` length + latest token count, `session_usage`, `counts`, `steps.length`, `active_checkpoint`, file lists (`system_files`, `skill_files`, `artifact_files`, `knowledge_files`), and subagent/worker tuples (`conversation_id`, `role`, `model`, `used_tokens`, `limit_tokens`, `request_budget_tokens`, `status`, `swarm_state`, `source`). Update this if you add new top-level summary fields rendered in the panel.
 
 ---
 
@@ -118,21 +124,33 @@ All protobuf decoding is schema-less wire decoding via `Msg` in `lib/protobuf.py
 Run these checks before finalizing any change (matches `.github/workflows/ci.yml`):
 
 ```bash
-# 1. Python syntax check
-python -m py_compile sidecars/inspector/inspector.py sidecars/inspector/lib/protobuf.py sidecars/inspector/lib/accounting.py sidecars/inspector/lib/subagents.py sidecars/inspector/lib/content.py
+# 1. Validate JSON manifests & version sync
+node -e '
+  const fs = require("node:fs");
+  const files = ["plugin.json", "sidecars/inspector/sidecar.json", "sidecars/inspector/package.json"];
+  const m = Object.fromEntries(files.map((p) => [p, JSON.parse(fs.readFileSync(p, "utf8"))]));
+  if (!m["plugin.json"].version || m["plugin.json"].version !== m["sidecars/inspector/package.json"].version) {
+    throw new Error("Version mismatch");
+  }
+  console.log("JSON & version sync OK:", m["plugin.json"].version);
+'
 
-# 2. Unit & end-to-end tests (synthetic SQLite + protobuf)
-python -m unittest discover -s tests -v
-
-# 3. Node.js & browser JS syntax check
+# 2. Node.js & frontend JS syntax check
 node --check sidecars/inspector/main.mjs
+node --check sidecars/inspector/inspector.mjs
+node --check sidecars/inspector/lib/protobuf.mjs
+node --check sidecars/inspector/lib/accounting.mjs
+node --check sidecars/inspector/lib/subagents.mjs
+node --check sidecars/inspector/lib/content.mjs
+node --check sidecars/inspector/lib/snapshot.mjs
 node --check sidecars/inspector/public/app.js
 node --check sidecars/inspector/public/js/utils.js
 node --check sidecars/inspector/public/js/sparkline.js
 node --check sidecars/inspector/public/js/views.js
+for f in tests/*.mjs; do node --check "$f"; done
 
-# 4. Validate JSON manifests
-python -c "import json, pathlib; [json.loads(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('plugin.json','sidecars/inspector/sidecar.json','sidecars/inspector/package.json')]; print('JSON OK')"
+# 3. Unit & end-to-end tests (synthetic SQLite + protobuf + frontend utils via node:test)
+node --test tests/*.test.mjs
 ```
 
 When modifying `scripts/install.ps1` (Windows PowerShell):
@@ -144,5 +162,5 @@ When modifying `scripts/install.ps1` (Windows PowerShell):
 ## Release & Editing Checklist
 
 - Keep `plugin.json` and `sidecars/inspector/package.json` version numbers synchronized when cutting a release.
-- Add or extend synthetic SQLite tests in `tests/test_inspector.py` for every parser, accounting, subagent, or URI edge-case change.
-- Test CLI smoke output when changing formatting: `python sidecars/inspector/inspector.py --db <path>` and `--json`.
+- Add or extend tests in the matching `tests/*.test.mjs` file for every parser, accounting, subagent, frontend helper, or URI edge-case change.
+- Test CLI smoke output when changing formatting: `node sidecars/inspector/inspector.mjs --db <path>` and `--json`.
