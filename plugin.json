@@ -1,0 +1,13 @@
+{
+  "name": "context-inspector",
+  "displayName": "Context Inspector",
+  "description": "Minimalist live context window monitor for Antigravity Desktop: exact token breakdown, request budget, inline content peek, subagent inspection, and one-click /compact.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Samet Ozbalkan",
+    "url": "https://github.com/sametozbalkan"
+  },
+  "homepage": "https://github.com/sametozbalkan/antigravity-context-inspector",
+  "repository": "https://github.com/sametozbalkan/antigravity-context-inspector",
+  "logo": "assets/logo.svg"
+}
