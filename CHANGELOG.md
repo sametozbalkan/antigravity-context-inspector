@@ -2,6 +2,18 @@
 
 All notable changes to **Antigravity Context Inspector** are documented in this file.
 
+## [1.2.1] - 2026-11-24
+
+### Fixed
+- **Breakdown & drill-down alignment:** Grouped conversation messages by the same step-type category as the row totals (`category` field + `categoryItems()` in `public/js/views.js`), fixing `SYSTEM_MESSAGE` and `ERROR_MESSAGE` items (which reach the model with `role=user`) previously inflating *User messages* and leaving *System messages* empty.
+- **Unknown breakdown groups:** Treated unknown `ContextWindowMetadata` group types (such as `0` "Unspecified", which carries the `Identity` section) as *System prompt* in both accounting and content parsing instead of dropping them from `used_tokens`.
+- **Chat label parsing:** Added support for `Message <n> (CHAT_MESSAGE_SOURCE_*)` chat breakdown labels and counted unknown step type names as tools rather than falling back to proportional scaling for the entire message list.
+- **Windows path shortening & deduplication:** Matched drive-letter home directories case-insensitively in `shortenPath()` and deduplicated detected file lists (`skill_files`, `artifact_files`, `knowledge_files`) by shortened path instead of raw URI.
+
+### Changed
+- **Testable server utilities (`lib/server_utils.mjs`):** Extracted pure helpers (`buildLightReport`, `workspacePath`, settings sanitization, and `compareSemver`) from `main.mjs` into `sidecars/inspector/lib/server_utils.mjs` (no `sidecar_sdk` dependency) and expanded the test suite to 41 tests.
+- **Housekeeping:** Removed the leftover `sidecars/inspector/lib/__init__.py` and Python `.gitignore` entries, and documented Node.js `22.16+` as the standalone CLI requirement in `README.md`.
+
 ## [1.2.0] - 2026-11-23
 
 ### Changed
