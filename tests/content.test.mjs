@@ -154,6 +154,73 @@ describe('TestContent', () => {
     });
   });
 
+  it('test_message_category_follows_step_type_not_role', () => {
+    withTempDir((tmpDir) => {
+      const dbPath = path.join(tmpDir, '70707070-1111-2222-3333-444444444444.db');
+      const con = createEmptyDb(dbPath);
+      try {
+        const breakdown = pbBytes(
+          1,
+          makeGroup(7, 'Chat Messages', 3232, [
+            ['0: USER_INPUT', 100],
+            ['1: SYSTEM_MESSAGE', 900],
+            ['2: PLANNER_RESPONSE', 400],
+            ['3: GENERIC', 1800],
+            ['4: ERROR_MESSAGE', 32],
+          ]),
+        );
+        const chatStart = concatBytes(pbVarint(2, -1), pbBytes(10, pbBytes(3, breakdown)));
+        // SYSTEM_MESSAGE and ERROR_MESSAGE steps reach the model as user-role messages
+        const msgs = [
+          concatBytes(pbVarint(2, 1), pbStr(3, 'Fix the bug'), pbVarint(4, 100)),
+          concatBytes(pbVarint(2, 1), pbStr(3, 'Reminder: keep going'), pbVarint(4, 900), pbVarint(18, 1)),
+          concatBytes(pbVarint(2, 2), pbStr(3, 'Looking into it'), pbVarint(4, 400), pbVarint(18, 2)),
+          concatBytes(pbVarint(2, 4), pbStr(3, 'file contents'), pbVarint(4, 1800), pbVarint(18, 3)),
+          concatBytes(pbVarint(2, 1), pbStr(3, 'Tool failed'), pbVarint(4, 32), pbVarint(18, 4)),
+          // Latest response: the breakdown has no label for it yet, so its role decides
+          concatBytes(pbVarint(2, 2), pbStr(3, 'Done.'), pbVarint(18, 5)),
+        ];
+        const chat = concatBytes(
+          ...msgs.map((m) => pbBytes(2, m)),
+          pbBytes(9, chatStart),
+          pbStr(19, 'gemini-4-neon-high'),
+        );
+        const gen = pbBytes(1, chat);
+        con.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)').run(gen, gen.length);
+      } finally {
+        con.close();
+      }
+
+      const snap = buildSnapshot(dbPath);
+      const messages = snap.content.messages;
+      assert.deepEqual(
+        messages.map((m) => m.role),
+        ['user', 'user', 'assistant', 'tool', 'user', 'assistant'],
+      );
+      assert.deepEqual(
+        messages.map((m) => m.category),
+        ['user', 'system_messages', 'agent', 'tool', 'tool', 'agent'],
+      );
+      assert.equal(messages[0].label, 'User message');
+      assert.equal(messages[1].label, 'System message');
+      assert.equal(messages[3].label, 'Tool result');
+      assert.equal(messages[4].label, 'Error message');
+      assert.equal(messages[5].label, 'Agent response');
+
+      // Labelled children add up to their category rows
+      const cats = Object.fromEntries(snap.summary.categories.map((c) => [c.key, c.tokens]));
+      assert.equal(cats.user, 100);
+      assert.equal(cats.system_messages, 900);
+      const labelled = messages.filter((m) => m.step_type);
+      for (const key of ['user', 'agent', 'tool', 'system_messages']) {
+        const childSum = labelled
+          .filter((m) => m.category === key)
+          .reduce((sum, m) => sum + m.tokens, 0);
+        assert.equal(childSum, cats[key], key);
+      }
+    });
+  });
+
   it('test_malformed_wire_json_catalog_and_db_cells', () => {
     withTempDir((tmpDir) => {
       // 1) Wrong wire types in extractTurnTelemetry (field 1/4/9 as varint)

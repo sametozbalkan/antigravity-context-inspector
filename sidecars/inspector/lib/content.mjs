@@ -9,6 +9,7 @@ import {
   CAT_TOOL,
   CAT_USER,
   GROUP_LABELS,
+  KNOWN_GROUP_TYPES,
   STEP_PLANNER_RESPONSE,
   STEP_TYPE_NAMES,
   STEP_USER_INPUT,
@@ -23,6 +24,8 @@ import {
   TOKEN_SYSTEM_PROMPT,
   TOKEN_TOOLS,
   TOKEN_WORKFLOWS,
+  chatCategoryKey,
+  parseChatLabel,
   pct,
   round1,
   stepCategory,
@@ -47,7 +50,23 @@ const SYSTEM_GROUP_TYPES = new Set([
   TOKEN_FLOWS,
 ]);
 
-const INT_RE = /^[+-]?[0-9]+$/;
+// Category row for a message the breakdown has no label for. Labelled messages take
+// their category from the label instead (see parseChatLabel), like the row totals do.
+const ROLE_CATEGORY = {
+  user: 'user',
+  assistant: 'agent',
+  tool: 'tool',
+  system: 'system_messages',
+};
+
+function roleCategory(role) {
+  return Object.hasOwn(ROLE_CATEGORY, role) ? ROLE_CATEGORY[role] : '';
+}
+
+function humanizeStepType(name) {
+  const text = String(name ?? '').toLowerCase().replace(/_+/g, ' ').trim();
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : '';
+}
 
 function partition(str, sep) {
   const idx = str.indexOf(sep);
@@ -149,7 +168,10 @@ export function parseBreakdownMaps(breakdown) {
   const section_group = new Map();
   const sys_tool_tokens = new Map();
   const mcp_tool_tokens = new Map();
+  // step index -> [step type name, tokens, category key]
   const step_tokens_map = new Map();
+  // message index -> [source name, tokens, category key]
+  const message_tokens_map = new Map();
 
   if (breakdown == null) {
     return {
@@ -159,20 +181,27 @@ export function parseBreakdownMaps(breakdown) {
       sys_tool_tokens,
       mcp_tool_tokens,
       step_tokens_map,
+      message_tokens_map,
     };
   }
 
   for (const g of breakdown.msgs(1)) {
     const gtype = g.int(2);
     const children = g.msgs(5);
-    if (SYSTEM_GROUP_TYPES.has(gtype)) {
+    // Unknown group types are system prompt, exactly as collectStats() counts them.
+    const sysGtype = SYSTEM_GROUP_TYPES.has(gtype)
+      ? gtype
+      : KNOWN_GROUP_TYPES.has(gtype)
+        ? null
+        : TOKEN_SYSTEM_PROMPT;
+    if (sysGtype !== null) {
       for (const ch of children) {
         const cname = ch.str(1);
         const ctok = Math.max(0, ch.int(3, { signed32: true }));
         const effGtype =
-          gtype === TOKEN_SYSTEM_PROMPT && Object.hasOwn(SYSTEM_PROMPT_SUBGROUPS, cname)
+          sysGtype === TOKEN_SYSTEM_PROMPT && Object.hasOwn(SYSTEM_PROMPT_SUBGROUPS, cname)
             ? SYSTEM_PROMPT_SUBGROUPS[cname]
-            : gtype;
+            : sysGtype;
         section_tokens.set(`${effGtype}\0${cname}`, ctok);
         if (!section_tokens_by_name.has(cname)) {
           section_tokens_by_name.set(cname, ctok);
@@ -191,13 +220,16 @@ export function parseBreakdownMaps(breakdown) {
       }
     } else if (gtype === TOKEN_CHAT_MESSAGES) {
       for (const ch of children) {
-        const [left, sep, right] = partition(ch.str(1), ': ');
-        if (sep && INT_RE.test(left)) {
-          step_tokens_map.set(
-            Number.parseInt(left, 10),
-            [right, Math.max(0, ch.int(3, { signed32: true }))],
-          );
+        const parsed = parseChatLabel(ch.str(1));
+        if (parsed === null) {
+          continue;
         }
+        const target = parsed.key === 'step' ? step_tokens_map : message_tokens_map;
+        target.set(parsed.index, [
+          parsed.name,
+          Math.max(0, ch.int(3, { signed32: true })),
+          chatCategoryKey(parsed.cat),
+        ]);
       }
     }
   }
@@ -209,6 +241,7 @@ export function parseBreakdownMaps(breakdown) {
     sys_tool_tokens,
     mcp_tool_tokens,
     step_tokens_map,
+    message_tokens_map,
   };
 }
 
@@ -223,6 +256,7 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
   const sysToolTokens = maps.sys_tool_tokens;
   const mcpToolTokens = maps.mcp_tool_tokens;
   const stepTokensMap = maps.step_tokens_map;
+  const messageTokensMap = maps.message_tokens_map;
 
   const chat = contentGen != null ? contentGen.msg(1) : null;
   const denom = Math.max(totalUsed, 1);
@@ -237,6 +271,9 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
       const body = sb.str(2);
       let gtype =
         sb.int(6) || (sectionGroup.has(name) ? sectionGroup.get(name) : TOKEN_SYSTEM_PROMPT);
+      if (!KNOWN_GROUP_TYPES.has(gtype)) {
+        gtype = TOKEN_SYSTEM_PROMPT;
+      }
       if (gtype === TOKEN_SYSTEM_PROMPT && Object.hasOwn(SYSTEM_PROMPT_SUBGROUPS, name)) {
         gtype = SYSTEM_PROMPT_SUBGROUPS[name];
       }
@@ -397,12 +434,24 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
       const resolvedToolName = toolCallId ? callIdToName.get(toolCallId) || '' : '';
       let tok = mb.int(4, { signed32: true });
       let stepTypeLabel = '';
+      let category = '';
       if (stepTokensMap.has(stepIdx)) {
-        const [bdLabel, bdTok] = stepTokensMap.get(stepIdx);
+        const [bdLabel, bdTok, bdCategory] = stepTokensMap.get(stepIdx);
         stepTypeLabel = bdLabel;
+        category = bdCategory;
         if (tok <= 0) {
           tok = bdTok;
         }
+      } else if (messageTokensMap.has(idx)) {
+        const [, bdTok, bdCategory] = messageTokensMap.get(idx);
+        category = bdCategory;
+        if (tok <= 0) {
+          tok = bdTok;
+        }
+      }
+      const fallbackCategory = roleCategory(role);
+      if (!category) {
+        category = fallbackCategory;
       }
 
       let tcChars = 0;
@@ -441,6 +490,11 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
       } else {
         label = `Message (${role})`;
       }
+      // A step sent under another role (e.g. SYSTEM_MESSAGE delivered as a user turn)
+      // is named after its step type so it reads correctly under its category row.
+      if (stepTypeLabel && category !== fallbackCategory) {
+        label = humanizeStepType(stepTypeLabel);
+      }
 
       const previewSrc =
         text ||
@@ -456,6 +510,7 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
         step_index: stepIdx,
         step_type: stepTypeLabel,
         role,
+        category,
         label,
         tool_name: resolvedToolName,
         tool_call_id: toolCallId,
@@ -516,6 +571,7 @@ export function extractContentItems(steps, contentGen, breakdown, totalUsed) {
         step_index: step.pos,
         step_type: sname,
         role,
+        category: roleCategory(role),
         label: `${roleTitle} (${sname})`,
         tool_name: '',
         tool_call_id: '',

@@ -12,6 +12,7 @@ import { describe, it } from 'node:test';
 import {
   detectSystemFiles,
   inferContextLimit,
+  pathDedupeKey,
   shortenPath,
 } from '../sidecars/inspector/lib/accounting.mjs';
 import { extractMcpServer } from '../sidecars/inspector/lib/content.mjs';
@@ -207,6 +208,43 @@ describe('TestSnapshotAndCli', () => {
       assert.equal(shortenPath(`${home}/projects/app`), '~/projects/app');
       const sibling = `${home}2/projects/app`;
       assert.equal(shortenPath(sibling), sibling);
+
+      // shortenPath: a drive-letter home matches whatever the case (Antigravity stores
+      // c:\Users\..., os.homedir() reports C:\Users\...)
+      const winHome = 'C:\\Users\\Ada';
+      const skill = '~/.gemini/skills/x/SKILL.md';
+      assert.equal(shortenPath('C:\\Users\\Ada\\.gemini\\skills\\x\\SKILL.md', winHome), skill);
+      assert.equal(shortenPath('c:\\Users\\Ada\\.gemini\\skills\\x\\SKILL.md', winHome), skill);
+      assert.equal(shortenPath('file:///c%3A/Users/Ada/.gemini/skills/x/SKILL.md', winHome), skill);
+      assert.equal(shortenPath('c:/users/ada', winHome), '~');
+      assert.equal(shortenPath('c:/Users/Ada2/projects', winHome), 'c:/Users/Ada2/projects');
+      assert.equal(shortenPath('d:/Users/Ada/projects', winHome), 'd:/Users/Ada/projects');
+      // POSIX homes stay case-sensitive
+      assert.equal(shortenPath('/home/ada/projects', '/home/ada'), '~/projects');
+      assert.equal(shortenPath('/home/Ada/projects', '/home/ada'), '/home/Ada/projects');
+
+      // pathDedupeKey: Windows spellings of one path share a key, POSIX paths do not
+      assert.equal(pathDedupeKey('c:/Proj/Notes.md', '/home/ada'), pathDedupeKey('C:/proj/notes.md', '/home/ada'));
+      assert.equal(pathDedupeKey('~/Notes.md', winHome), pathDedupeKey('~/notes.md', winHome));
+      assert.notEqual(pathDedupeKey('~/Notes.md', '/home/ada'), pathDedupeKey('~/notes.md', '/home/ada'));
+
+      // The same skill file viewed under two drive-letter spellings is listed once
+      const dbSkills = path.join(tmpDir, '80808080-1111-2222-3333-444444444444.db');
+      const conSkills = createEmptyDb(dbSkills);
+      try {
+        const ins = conSkills.prepare(
+          'INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, 8, 3, ?)',
+        );
+        ['C:\\Proj\\skills\\x\\SKILL.md', 'c:\\Proj\\skills\\x\\SKILL.md'].forEach((p, idx) => {
+          const viewFile = concatBytes(pbStr(1, p), pbVarint(17, 1));
+          ins.run(idx, concatBytes(pbVarint(1, 8), pbVarint(4, 3), pbBytes(14, viewFile)));
+        });
+      } finally {
+        conSkills.close();
+      }
+      const skillFiles = buildSnapshot(dbSkills).summary.skill_files;
+      assert.equal(skillFiles.length, 1);
+      assert.equal(skillFiles[0].path, 'C:/Proj/skills/x/SKILL.md');
 
       // detectSystemFiles with custom geminiDir
       const customGemini = path.join(tmpDir, 'custom_gemini');

@@ -8,7 +8,7 @@ Guidance for AI coding agents working in this repository.
 
 ### Hard Constraints
 - **Zero external dependencies.** No `npm install`, no Python requirement, no bundler/build step.
-  - Backend & Parser: Antigravity's bundled Node.js runtime (ESM, Node 22.5+ / 24+) using built-ins (`node:sqlite`, `node:crypto`, `node:fs`, `node:http`, `node:https`, `node:util`, `node:child_process`) + host-provided `sidecar_sdk`.
+  - Backend & Parser: Antigravity's bundled Node.js runtime (ESM, Node 22.16+ / 24+: `node:sqlite` is unflagged from 22.13 and its `timeout` option arrived in 22.16) using built-ins (`node:sqlite`, `node:crypto`, `node:fs`, `node:http`, `node:https`, `node:util`, `node:child_process`) + host-provided `sidecar_sdk`.
   - Frontend: Vanilla HTML, CSS, and JS served directly from `sidecars/inspector/public/`.
 - **Strictly read-only DB access.** Never open Antigravity conversation SQLite databases in read-write mode. Always use `openSqliteReadOnly()` (`new DatabaseSync(dbPath, { readOnly: true, timeout })` inside `BEGIN`/`ROLLBACK`).
 - **Zero extra LLM token cost.** All accounting comes from existing local SQLite conversation records and Language Server metadata.
@@ -34,7 +34,8 @@ Guidance for AI coding agents working in this repository.
 │   │   ├── accounting.mjs              # Read-only `node:sqlite` loader, token accounting, step rehydration, compaction, file detection
 │   │   ├── subagents.mjs               # Subagent (`invoke_subagent`) & Swarm worker discovery and stats
 │   │   ├── content.mjs                 # System sections, tool schemas, active messages for inline peek
-│   │   └── snapshot.mjs                # Snapshot assembler (`buildSnapshot`), CLI formatter, SHA-1 fingerprinting
+│   │   ├── snapshot.mjs                # Snapshot assembler (`buildSnapshot`), CLI formatter, SHA-1 fingerprinting
+│   │   └── server_utils.mjs            # Pure `main.mjs` helpers testable without `sidecar_sdk` (light report index, workspace URI validation, settings sanitization, semver)
 │   └── public/
 │       ├── index.html                  # Loads `/preload.js`, `/styles.css`, and classic `/app.js`
 │       ├── styles.css                  # Native Antigravity dark/light theme-aware styling
@@ -42,14 +43,15 @@ Guidance for AI coding agents working in this repository.
 │       └── js/
 │           ├── utils.js                # Shared constants, formatting, escaping, clipboard & path helpers
 │           ├── sparkline.js            # Turn-by-turn SVG sparkline renderer & hover interaction
-│           └── views.js                # Pure HTML template renderers (peek, categories, MCP, subagents, settings, update drawer)
+│           └── views.js                # Pure category grouping (`categoryItems`) & HTML template renderers (peek, categories, MCP, subagents, settings, update drawer)
 ├── tests/
 │   ├── helpers.mjs                     # Shared synthetic protobuf/SQLite test builders
 │   ├── protobuf.test.mjs               # Wire-level protobuf & varint tests
-│   ├── accounting.test.mjs             # Token breakdown, compaction, history & cache drop tests
+│   ├── accounting.test.mjs             # Token breakdown, unknown groups, chat label formats, compaction, history & cache drop tests
 │   ├── subagents.test.mjs              # Subagent rehydration, quickSubagentStats & Swarm tests
-│   ├── content.test.mjs                # Subgroups, MCP server grouping, preview & malformed input tests
+│   ├── content.test.mjs                # Subgroups, message categories, MCP server grouping, preview & malformed input tests
 │   ├── snapshot_cli.test.mjs           # Fingerprinting, URI/path edge cases & CLI tests
+│   ├── server_utils.test.mjs           # Light report index, workspace URI validation, settings & semver tests
 │   └── frontend_utils.test.mjs         # Zero-dep `node:vm` tests for `public/js/{utils,sparkline,views}.js`
 └── .github/workflows/ci.yml            # Cross-platform CI (Ubuntu, macOS, Windows; Node 24)
 ```
@@ -73,11 +75,12 @@ Guidance for AI coding agents working in this repository.
    - Persists UI preferences to `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/settings.json` with strict value sanitization (`GET /api/settings`, `POST /api/settings/save`).
    - Fetches live model limits (`maxTokens`, `displayName`) from Antigravity's Language Server (`GetAvailableModels` via `ANTIGRAVITY_LS_ADDRESS` + `ANTIGRAVITY_CSRF_TOKEN`), cached to `model-catalog.json` (10 min TTL, 60s retry cooldown on failure, single in-flight request).
    - Checks GitHub Releases every 12h (`/api/update-status`) and supports explicit user-triggered `git pull --ff-only` (`POST /api/update`).
+   - Keeps its pure helpers (`buildLightReport`, `workspacePath`, `sanitizeSettings` / `mergeSettings`, `compareSemver`) in `lib/server_utils.mjs`, which must never import `sidecar_sdk`: `main.mjs` only loads inside the host, so logic left in it cannot be unit tested.
 3. **Parser (`lib/` + `inspector.mjs`)**:
    - `loadDbWithHistory()` (`lib/accounting.mjs`) opens SQLite via `DatabaseSync({ readOnly: true })` and performs a single streaming read-only pass (`BEGIN`/`ROLLBACK` + `stmt.iterate()`) over `steps` and `gen_metadata`, using zero-copy `iterFields()` (`lib/protobuf.mjs` — `BigInt` varints and `Uint8Array.subarray`) to extract per-turn sparkline `history` (last 120 turns) and weighted `sessionUsage` while retaining only the latest `latestStatsBytes` and `latestContentBytes` blobs before decoding.
    - `extractSubagents()` in `lib/subagents.mjs` discovers both `invoke_subagent` subagents (`source: "subagent"`) and Swarm workers (`source: "swarm"`) from `<appData>/brain/<convId>/.system_generated/swarm/members.json`.
    - `extractMcpServer()` in `lib/content.mjs` infers `mcp_server` (`mcp_<server>_<tool>`, `<server>__<tool>`, `server:tool`, `server/tool`, fallback `other`) for MCP server-level breakdown in the UI.
-   - `buildSnapshot()` (`lib/snapshot.mjs`) emits `{ summary, content }`; `main.mjs` strips heavy content bodies into `lightReport.index` for `/api/report` and serves full items from cache on `/api/item`.
+   - `buildSnapshot()` (`lib/snapshot.mjs`) emits `{ summary, content }`; `buildLightReport()` (`lib/server_utils.mjs`) strips heavy content bodies into `lightReport.index` for `/api/report`, and `main.mjs` serves full items from cache on `/api/item`.
 
 ---
 
@@ -97,12 +100,17 @@ All protobuf decoding is schema-less wire decoding via `Msg` and `iterFields()` 
 - **`ContextWindowMetadata.breakdown`**:
   - `[1]` repeated groups: `[1]` name, `[2]` group type (`TOKEN_*`), `[4]` total tokens (signed32), `[5]` repeated children (`[1]` name, `[3]` tokens signed32).
   - **`SYSTEM_PROMPT_SUBGROUPS` invariant**: Antigravity may nest `flows`, `skills`, and `subagents` inside `TOKEN_SYSTEM_PROMPT (1)`. Both `accounting.mjs` (category totals) and `content.mjs` (`parseBreakdownMaps` + `extractContentItems`) must map them via the shared `SYSTEM_PROMPT_SUBGROUPS` dict (`flows -> TOKEN_FLOWS (10)`, `skills -> TOKEN_SKILLS (5)`, `subagents -> TOKEN_SUBAGENTS (6)`) so category rows and expandable drill-down items stay aligned.
+  - **Unknown group types**: any group type outside `KNOWN_GROUP_TYPES` (`TOKEN_*` 1–10) — e.g. `0` "Unspecified", which carries the `Identity` section — is treated as `TOKEN_SYSTEM_PROMPT` by both `accounting.mjs` (`collectStats`) and `content.mjs` (`parseBreakdownMaps` + section `group_type`), so its tokens stay in `used_tokens` and its sections keep exact per-item counts. Only a real `TOKEN_SYSTEM_PROMPT` group turns off the `system_overhead` estimate.
+  - **Chat label formats (`parseChatLabel()`)**: `TOKEN_CHAT_MESSAGES (7)` children are labelled either `<stepIdx>: <STEP_TYPE>` (keyed by step index) or `Message <n> (CHAT_MESSAGE_SOURCE_<USER|SYSTEM|TOOL>)` (keyed by message index; `SYSTEM` is the model's own turn). `parseChatLabel()` in `accounting.mjs` is the only parser for both. Step type names missing from `STEP_TYPES` count as tools; only a label matching neither format sends `chatTokensByCategory()` to the proportional fallback.
+  - **Chat category alignment invariant**: Antigravity delivers `SYSTEM_MESSAGE` / `ERROR_MESSAGE` steps as `role = user` messages, so conversation rows must never be grouped by role alone. `content.mjs` gives every message item a `category` (`user`, `agent`, `tool`, `system_messages`) from the same label mapping as the row totals (`chatCategoryKey()`), falling back to role only when the breakdown has no label for the message (e.g. the latest response). `buildLightReport()` (`lib/server_utils.mjs`) forwards `category` in `lightReport.index.messages`, and `categoryItems()` in `public/js/views.js` groups by it (role is only the fallback for payloads without `category`). Known gap: a `SYSTEM_MESSAGE` appended to the preceding tool result has a label but no message of its own, so its tokens stay inside that tool item.
 - **`steps` table & Rehydration**:
   - Generic tool steps (`step_type = 132`, payload field `140`) may wrap an original step in `__original_cortex_step` (`type_url` ending `/gemini_coder.Step`).
   - `Step._rehydrate()` **must** preserve `this.genericResultText` before replacing `this.pb` so `extractSubagents()` can still read spawned `conversationId` values from rehydrated `INVOKE_SUBAGENT (127)` steps. `extractSubagentId()` also falls back to scanning non-metadata payload fields for native `step_type = 127` steps.
 - **Compaction / Checkpoints**:
   - A completed `CHECKPOINT` step (`step_type = 23`, `status = 3`, payload field `30`) with `ck.index > chat_start.active_checkpoint` overrides pre-checkpoint chat token counts with post-checkpoint steps + checkpoint summary tokens.
   - `quickSubagentStats()` opens each subagent DB read-only (`DatabaseSync({ readOnly: true })` inside `BEGIN`/`ROLLBACK`), reads up to 5 non-null `gen_metadata` rows, and performs a targeted query for the latest completed `step_type = 23` step, loading post-checkpoint steps only when compaction occurred.
+- **File lists (`skill_files`, `artifact_files`, `knowledge_files`)**:
+  - Antigravity stores most Windows paths with a lowercase drive letter (`c:\Users\...`) while `os.homedir()` reports `C:\Users\...`. `shortenPath()` therefore matches a drive-letter home ignoring case (POSIX homes stay case-sensitive), and `collectStats()` dedupes entries by `pathDedupeKey()` of the shortened path rather than by raw URI.
 - **Snapshot `fingerprint` (`lib/snapshot.mjs`)**:
   - Hashes `used_tokens`, `limit_tokens`, `request_budget_tokens`, `model`, `has_breakdown`, `compacted`, `checkpoint_buffer`, `checkpoints`, category `(key, tokens)` pairs, `api_usage`, `history` length + latest token count, `session_usage`, `counts`, `steps.length`, `active_checkpoint`, file lists (`system_files`, `skill_files`, `artifact_files`, `knowledge_files`), and subagent/worker tuples (`conversation_id`, `role`, `model`, `used_tokens`, `limit_tokens`, `request_budget_tokens`, `status`, `swarm_state`, `source`). Update this if you add new top-level summary fields rendered in the panel.
 
@@ -143,6 +151,7 @@ node --check sidecars/inspector/lib/accounting.mjs
 node --check sidecars/inspector/lib/subagents.mjs
 node --check sidecars/inspector/lib/content.mjs
 node --check sidecars/inspector/lib/snapshot.mjs
+node --check sidecars/inspector/lib/server_utils.mjs
 node --check sidecars/inspector/public/app.js
 node --check sidecars/inspector/public/js/utils.js
 node --check sidecars/inspector/public/js/sparkline.js

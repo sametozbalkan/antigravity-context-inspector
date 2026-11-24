@@ -6,6 +6,13 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
+import {
+  CAT_AGENT,
+  CAT_SYSTEM,
+  CAT_TOOL,
+  CAT_USER,
+  parseChatLabel,
+} from '../sidecars/inspector/lib/accounting.mjs';
 import { buildSnapshot } from '../sidecars/inspector/lib/snapshot.mjs';
 import {
   buildFullConversationDb,
@@ -261,6 +268,181 @@ describe('TestAccounting', () => {
       assert.equal(catsProp.user, 500);
       assert.equal(catsProp.system_messages, 500);
       assert.equal(snapProp.used_tokens, 1000);
+    });
+  });
+
+  it('test_unknown_breakdown_group_counts_as_system_prompt', () => {
+    withTempDir((tmpDir) => {
+      // Case A: type 0 "Unspecified" group (Identity) next to a real system prompt group
+      const dbPath = path.join(tmpDir, '40404040-1111-2222-3333-444444444444.db');
+      const con = createEmptyDb(dbPath);
+      try {
+        const breakdown = concatBytes(
+          pbBytes(1, makeGroup(0, 'Unspecified', 199, [['Identity', 199]])),
+          pbBytes(
+            1,
+            makeGroup(1, 'System Prompt', 1457, [
+              ['user_information', 220],
+              ['artifacts', 1237],
+            ]),
+          ),
+          pbBytes(1, makeGroup(7, 'Chat Messages', 300, [['0: USER_INPUT', 300]])),
+        );
+        const chatStart = concatBytes(pbVarint(2, -1), pbBytes(10, pbBytes(3, breakdown)));
+        // The Identity section carries no group type of its own (field 6 omitted);
+        // its 720-byte body would estimate to 180 tokens, not the exact 199.
+        const secIdentity = concatBytes(pbStr(1, 'Identity'), pbStr(2, 'You are an agent. '.repeat(40)));
+        const secInfo = concatBytes(pbStr(1, 'user_information'), pbStr(2, 'OS: test'), pbVarint(6, 1));
+        const secArtifacts = concatBytes(pbStr(1, 'artifacts'), pbStr(2, 'Artifact rules'), pbVarint(6, 1));
+        const chat = concatBytes(
+          pbBytes(9, chatStart),
+          pbBytes(16, secIdentity),
+          pbBytes(16, secInfo),
+          pbBytes(16, secArtifacts),
+          pbStr(19, 'gemini-4-neon-high'),
+        );
+        const gen = pbBytes(1, chat);
+        con.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)').run(gen, gen.length);
+      } finally {
+        con.close();
+      }
+
+      const snap = buildSnapshot(dbPath);
+      const cats = Object.fromEntries(snap.summary.categories.map((c) => [c.key, c.tokens]));
+      assert.equal(cats.system_prompt, 199 + 1457);
+      assert.equal(snap.summary.used_tokens, 199 + 1457 + 300);
+
+      // Drill-down uses the exact breakdown value and adds up to the row total
+      const secs = snap.content.system_sections;
+      const identity = secs.find((s) => s.name === 'Identity');
+      assert.equal(identity.group_type, 1);
+      assert.equal(identity.tokens, 199);
+      assert.equal(identity.estimated, false);
+      const promptChildren = secs
+        .filter((s) => s.group_type === 1)
+        .reduce((sum, s) => sum + s.tokens, 0);
+      assert.equal(promptChildren, cats.system_prompt);
+
+      // Case B: no real prompt/tools group -> the overhead estimate must not double count it
+      const dbOverhead = path.join(tmpDir, '41414141-1111-2222-3333-444444444444.db');
+      const conOverhead = createEmptyDb(dbOverhead);
+      try {
+        const breakdown = concatBytes(
+          pbBytes(1, makeGroup(0, 'Unspecified', 199, [['Identity', 199]])),
+          pbBytes(1, makeGroup(3, 'Rules', 1000, [['r1', 1000]])),
+          pbBytes(
+            1,
+            makeGroup(7, 'Chat Messages', 4000, [
+              ['0: USER_INPUT', 1500],
+              ['1: PLANNER_RESPONSE', 2500],
+            ]),
+          ),
+        );
+        const chatStart = concatBytes(pbVarint(2, -1), pbBytes(10, pbBytes(3, breakdown)));
+        const usage = concatBytes(pbVarint(2, 2000), pbVarint(5, 8000)); // total api_input = 10_000
+        const chat = concatBytes(pbBytes(4, usage), pbBytes(9, chatStart), pbStr(19, 'gemini-4-neon-high'));
+        const gen = pbBytes(1, chat);
+        conOverhead
+          .prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)')
+          .run(gen, gen.length);
+      } finally {
+        conOverhead.close();
+      }
+
+      const snapOverhead = buildSnapshot(dbOverhead).summary;
+      const catsOverhead = Object.fromEntries(snapOverhead.categories.map((c) => [c.key, c.tokens]));
+      assert.equal(catsOverhead.system_prompt, 199);
+      assert.equal(catsOverhead.system_overhead, 10_000 - 4000 - 1000 - 199);
+      assert.equal(snapOverhead.used_tokens, 10_000);
+    });
+  });
+
+  it('test_chat_label_formats_and_unknown_step_types', () => {
+    // parseChatLabel: both label formats, unknown names and rejects
+    assert.deepEqual(parseChatLabel('12: USER_INPUT'), {
+      key: 'step',
+      index: 12,
+      name: 'USER_INPUT',
+      cat: CAT_USER,
+    });
+    assert.equal(parseChatLabel('3: SYSTEM_MESSAGE').cat, CAT_SYSTEM);
+    assert.equal(parseChatLabel('4: BRAND_NEW_TOOL').cat, CAT_TOOL);
+    assert.deepEqual(parseChatLabel('Message 7 (CHAT_MESSAGE_SOURCE_SYSTEM)'), {
+      key: 'message',
+      index: 7,
+      name: 'SYSTEM',
+      cat: CAT_AGENT,
+    });
+    assert.equal(parseChatLabel('Message 0 (CHAT_MESSAGE_SOURCE_USER)').cat, CAT_USER);
+    assert.equal(parseChatLabel('Message 2 (CHAT_MESSAGE_SOURCE_TOOL)').cat, CAT_TOOL);
+    assert.equal(parseChatLabel('Message 9 (CHAT_MESSAGE_SOURCE_UNKNOWN)').cat, CAT_SYSTEM);
+    for (const bad of ['bad-label', 'x: USER_INPUT', '5: ', 'Message 3', 'Message x (CHAT_MESSAGE_SOURCE_USER)', '']) {
+      assert.equal(parseChatLabel(bad), null);
+    }
+
+    withTempDir((tmpDir) => {
+      function insertGen(dbPath, chatChildren, messages) {
+        const con = createEmptyDb(dbPath);
+        try {
+          const total = chatChildren.reduce((sum, [, tok]) => sum + tok, 0);
+          const breakdown = pbBytes(1, makeGroup(7, 'Chat Messages', total, chatChildren));
+          const chatStart = concatBytes(pbVarint(2, -1), pbBytes(10, pbBytes(3, breakdown)));
+          const chat = concatBytes(
+            ...messages.map((m) => pbBytes(2, m)),
+            pbBytes(9, chatStart),
+            pbStr(19, 'gemini-4-neon-high'),
+          );
+          const gen = pbBytes(1, chat);
+          con.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)').run(gen, gen.length);
+        } finally {
+          con.close();
+        }
+      }
+
+      // Case A: "Message <n> (CHAT_MESSAGE_SOURCE_<NAME>)" labels keyed by message index.
+      // Messages carry no token counts of their own, so tokens must come from the labels.
+      const dbMsgLabels = path.join(tmpDir, '60606060-1111-2222-3333-444444444444.db');
+      insertGen(
+        dbMsgLabels,
+        [
+          ['Message 0 (CHAT_MESSAGE_SOURCE_USER)', 135],
+          ['Message 1 (CHAT_MESSAGE_SOURCE_SYSTEM)', 233],
+          ['Message 2 (CHAT_MESSAGE_SOURCE_TOOL)', 1170],
+        ],
+        [
+          concatBytes(pbVarint(2, 1), pbStr(3, 'Summarize the repo')),
+          concatBytes(pbVarint(2, 2), pbStr(3, 'Reading files'), pbVarint(18, 2)),
+          concatBytes(pbVarint(2, 4), pbStr(3, 'file contents'), pbVarint(18, 3)),
+        ],
+      );
+      const snapMsg = buildSnapshot(dbMsgLabels);
+      const catsMsg = Object.fromEntries(snapMsg.summary.categories.map((c) => [c.key, c.tokens]));
+      assert.equal(catsMsg.user, 135);
+      assert.equal(catsMsg.agent, 233);
+      assert.equal(catsMsg.tool, 1170);
+      assert.equal(snapMsg.summary.used_tokens, 1538);
+      assert.deepEqual(snapMsg.content.messages.map((m) => m.tokens), [135, 233, 1170]);
+      assert.deepEqual(snapMsg.content.messages.map((m) => m.category), ['user', 'agent', 'tool']);
+      assert.deepEqual(snapMsg.content.messages.map((m) => m.estimated), [false, false, false]);
+
+      // Case B: one step type name this parser has never seen counts as a tool;
+      // the other rows stay exact instead of falling back to proportional scaling.
+      const dbUnknown = path.join(tmpDir, '61616161-1111-2222-3333-444444444444.db');
+      insertGen(
+        dbUnknown,
+        [
+          ['0: USER_INPUT', 100],
+          ['1: PLANNER_RESPONSE', 200],
+          ['2: BRAND_NEW_TOOL', 400],
+        ],
+        [],
+      );
+      const catsUnknown = Object.fromEntries(
+        buildSnapshot(dbUnknown).summary.categories.map((c) => [c.key, c.tokens]),
+      );
+      assert.equal(catsUnknown.user, 100);
+      assert.equal(catsUnknown.agent, 200);
+      assert.equal(catsUnknown.tool, 400);
     });
   });
 });

@@ -13,9 +13,17 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, 
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
+import {
+  DEFAULT_SETTINGS,
+  buildLightReport,
+  compareSemver,
+  mergeSettings,
+  sanitizeSettings,
+  workspacePath,
+} from './lib/server_utils.mjs';
 import { buildSnapshot } from './lib/snapshot.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,14 +35,6 @@ const BRAIN_DIR = join(GEMINI_DIR, 'antigravity', 'brain');
 const DATA_DIR = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || join(HERE, '.data');
 const CATALOG_PATH = join(DATA_DIR, 'model-catalog.json');
 const SETTINGS_PATH = join(DATA_DIR, 'settings.json');
-
-const DEFAULT_SETTINGS = {
-  compactThreshold: 60,
-  displayMode: 'native',
-  compactAction: 'send',
-};
-const ALLOWED_THRESHOLDS = new Set([0, 50, 60, 75]);
-const THRESHOLD_STR_RE = /^(0|50|60|75)$/;
 
 const GITHUB_REPO = 'sametozbalkan/antigravity-context-inspector';
 const CATALOG_TTL_MS = 10 * 60 * 1000;
@@ -241,16 +241,6 @@ function readLocalVersion() {
   }
 }
 
-function compareSemver(a, b) {
-  const pa = String(a || '0').replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
-  const pb = String(b || '0').replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const diff = (pa[i] || 0) - (pb[i] || 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
 function defaultUpdateCommand(isGit) {
   if (isGit) {
     const quoted = process.platform === 'win32'
@@ -346,26 +336,6 @@ const snapshotCache = new Map();
 const snapshotInFlight = new Map();
 const snapshotSeq = new Map();
 
-function workspacePath(uri) {
-  if (typeof uri !== 'string' || !uri || uri.includes('\0')) return '';
-  let p = uri;
-  if (uri.startsWith('file:')) {
-    try {
-      const parsed = new URL(uri);
-      if (parsed.hostname !== '' && parsed.hostname.toLowerCase() !== 'localhost') {
-        return '';
-      }
-      p = fileURLToPath(parsed);
-    } catch {
-      return '';
-    }
-  }
-  if (!p || p.includes('\0') || /^(\\\\|\/\/)/.test(p) || p.startsWith('-') || !isAbsolute(p)) {
-    return '';
-  }
-  return p;
-}
-
 function fileStamp(p) {
   try {
     const s = statSync(p);
@@ -399,49 +369,6 @@ function anySubagentModifiedSince(subIds, cutoffMs) {
     const p = join(CONVERSATIONS_DIR, `${id}.db`);
     return fileMtimeMs(p) >= cutoffMs || fileMtimeMs(`${p}-wal`) >= cutoffMs;
   });
-}
-
-function buildLightReport(snapshot, updatedAt) {
-  const { summary, content } = snapshot;
-  return {
-    summary,
-    updatedAt,
-    index: {
-      system_sections: content.system_sections.map((s) => ({
-        id: s.id,
-        kind: s.kind,
-        name: s.name,
-        group: s.group,
-        group_type: s.group_type,
-        tokens: s.tokens,
-        chars: s.chars,
-        preview: s.preview,
-      })),
-      tools: content.tools.map((t) => ({
-        id: t.id,
-        kind: t.kind,
-        name: t.name,
-        is_mcp: t.is_mcp,
-        mcp_server: t.mcp_server || '',
-        tokens: t.tokens,
-        chars: t.chars,
-        preview: t.preview,
-      })),
-      messages: content.messages.map((m) => ({
-        id: m.id,
-        kind: m.kind,
-        index: m.index,
-        role: m.role,
-        label: m.label,
-        tool_name: m.tool_name,
-        has_thinking: m.has_thinking,
-        tool_call_count: m.tool_call_count,
-        tokens: m.tokens,
-        chars: m.chars,
-        preview: m.preview,
-      })),
-    },
-  };
 }
 
 async function getSnapshotEntry(conversationId, workspaceUri) {
@@ -523,25 +450,6 @@ async function getSnapshotEntry(conversationId, workspaceUri) {
 
 // --- Persisted user settings -------------------------------------------------
 
-function parseThreshold(val) {
-  if (typeof val === 'number' && Number.isFinite(val) && ALLOWED_THRESHOLDS.has(val)) {
-    return val;
-  }
-  if (typeof val === 'string' && THRESHOLD_STR_RE.test(val)) {
-    return Number(val);
-  }
-  return DEFAULT_SETTINGS.compactThreshold;
-}
-
-function sanitizeSettings(raw) {
-  const src = raw && typeof raw === 'object' ? raw : {};
-  return {
-    compactThreshold: parseThreshold(src.compactThreshold),
-    displayMode: src.displayMode === 'budget' ? 'budget' : 'native',
-    compactAction: src.compactAction === 'copy' ? 'copy' : 'send',
-  };
-}
-
 function loadSettings() {
   try {
     if (existsSync(SETTINGS_PATH)) {
@@ -554,13 +462,7 @@ function loadSettings() {
 }
 
 function saveSettings(patch) {
-  const cleanPatch = {};
-  if (patch && typeof patch === 'object' && !Array.isArray(patch)) {
-    for (const [k, v] of Object.entries(patch)) {
-      if (v !== undefined) cleanPatch[k] = v;
-    }
-  }
-  const next = sanitizeSettings({ ...loadSettings(), ...cleanPatch });
+  const next = mergeSettings(loadSettings(), patch);
   writeFileAtomic(SETTINGS_PATH, JSON.stringify(next, null, 2));
   return next;
 }

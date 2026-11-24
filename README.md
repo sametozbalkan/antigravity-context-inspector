@@ -128,7 +128,8 @@ antigravity-context-inspector/
 │   │   ├── accounting.mjs             # Read-only node:sqlite loader, token breakdown, checkpoints, file detection
 │   │   ├── subagents.mjs              # Subagent & Swarm worker discovery and stats
 │   │   ├── content.mjs                # System sections, tool schemas, active messages
-│   │   └── snapshot.mjs               # Snapshot assembler, CLI text formatter & SHA-1 fingerprinting
+│   │   ├── snapshot.mjs               # Snapshot assembler, CLI text formatter & SHA-1 fingerprinting
+│   │   └── server_utils.mjs           # Pure server helpers (light report index, workspace URI validation, settings, semver)
 │   └── public/
 │       ├── index.html                 # HTML shell (loads classic /app.js)
 │       ├── styles.css                 # Theme-aware minimalist CSS
@@ -139,7 +140,7 @@ antigravity-context-inspector/
 │           └── views.js               # Pure HTML template renderers
 └── tests/
     ├── helpers.mjs                    # Shared synthetic protobuf & SQLite test builders
-    └── *.test.mjs                     # Modular node:test suites (protobuf, accounting, subagents, content, CLI, frontend)
+    └── *.test.mjs                     # Modular node:test suites (protobuf, accounting, subagents, content, CLI, server helpers, frontend)
 ```
 
 ### How it works
@@ -152,7 +153,7 @@ antigravity-context-inspector/
 
 ## CLI Usage & Testing
 
-The Node.js parser also works standalone from the command line (Node.js 22.5+ / 24+):
+The Node.js parser also works standalone from the command line (Node.js 22.16+ / 24+):
 
 ```bash
 # Latest Antigravity Desktop conversation

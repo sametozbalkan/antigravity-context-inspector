@@ -9,6 +9,71 @@
     splitPath,
   } = CI.utils;
 
+  const SECTION_GROUP_TYPE_BY_KEY = {
+    system_prompt: 1,
+    rules: 3,
+    skills: 5,
+    subagents: 6,
+    legacy_workflows: 8,
+    plugins: 9,
+    workflows: 10,
+  };
+  const MESSAGE_CATEGORY_KEYS = new Set(['user', 'agent', 'tool', 'system_messages']);
+  const ROLE_CATEGORY = {
+    user: 'user',
+    assistant: 'agent',
+    tool: 'tool',
+    system: 'system_messages',
+  };
+
+  // Category row a message belongs to. The backend derives `category` from the same
+  // breakdown labels as the row totals; `role` only covers payloads without it.
+  function messageCategory(m) {
+    if (m.category) return m.category;
+    return Object.hasOwn(ROLE_CATEGORY, m.role) ? ROLE_CATEGORY[m.role] : '';
+  }
+
+  // Drill-down children for one breakdown category row.
+  function categoryItems(idx, key) {
+    if (!idx) return [];
+    if (Object.hasOwn(SECTION_GROUP_TYPE_BY_KEY, key)) {
+      const gt = SECTION_GROUP_TYPE_BY_KEY[key];
+      return idx.system_sections
+        .filter((s) => s.group_type === gt)
+        .sort((a, b) => b.tokens - a.tokens)
+        .map((s) => ({ kind: 'system', id: s.id, title: s.name, sub: s.preview, tokens: s.tokens }));
+    }
+    if (key === 'system_tools') {
+      return idx.tools
+        .filter((t) => !t.is_mcp)
+        .sort((a, b) => b.tokens - a.tokens)
+        .map((t) => ({ kind: 'tool', id: t.id, title: t.name, sub: t.preview, tokens: t.tokens }));
+    }
+    if (key === 'mcp_tools') {
+      return idx.tools
+        .filter((t) => t.is_mcp)
+        .sort((a, b) => b.tokens - a.tokens)
+        .map((t) => ({
+          kind: 'tool',
+          id: t.id,
+          title: t.name,
+          sub: t.preview,
+          tokens: t.tokens,
+          server: t.mcp_server || 'other',
+        }));
+    }
+    if (MESSAGE_CATEGORY_KEYS.has(key)) {
+      const msgs = idx.messages.filter((m) => messageCategory(m) === key);
+      if (key === 'tool') {
+        return msgs
+          .sort((a, b) => b.tokens - a.tokens)
+          .map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.tool_name || m.label}`, sub: m.preview, tokens: m.tokens }));
+      }
+      return msgs.map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.label}`, sub: m.preview, tokens: m.tokens }));
+    }
+    return [];
+  }
+
   function renderPeek(kind, id, ctx) {
     const cacheKey = `${ctx.activeCid}:${ctx.fingerprint}:${kind}:${id}`;
     const item = ctx.itemCache.get(cacheKey);
@@ -273,6 +338,8 @@
   }
 
   CI.views = {
+    categoryItems,
+    messageCategory,
     renderPeek,
     renderChildRow,
     renderMcpServerChildren,

@@ -9,6 +9,7 @@ const {
 } = CI.utils;
 const { renderSparkline, wireSparkline } = CI.sparkline;
 const {
+  categoryItems,
   renderCategoryRow,
   renderCompactControl,
   renderFilesSection,
@@ -119,65 +120,7 @@ function resetViewState({ clearCache = false, transition = '' } = {}) {
 // --- Breakdown drill-down ---
 
 function itemsForCategory(key) {
-  if (!state.report || !state.report.index) return [];
-  const idx = state.report.index;
-  const gtypeMap = {
-    system_prompt: 1,
-    rules: 3,
-    skills: 5,
-    subagents: 6,
-    legacy_workflows: 8,
-    plugins: 9,
-    workflows: 10,
-  };
-  if (Object.hasOwn(gtypeMap, key)) {
-    const gt = gtypeMap[key];
-    return idx.system_sections
-      .filter((s) => s.group_type === gt)
-      .sort((a, b) => b.tokens - a.tokens)
-      .map((s) => ({ kind: 'system', id: s.id, title: s.name, sub: s.preview, tokens: s.tokens }));
-  }
-  if (key === 'system_tools') {
-    return idx.tools
-      .filter((t) => !t.is_mcp)
-      .sort((a, b) => b.tokens - a.tokens)
-      .map((t) => ({ kind: 'tool', id: t.id, title: t.name, sub: t.preview, tokens: t.tokens }));
-  }
-  if (key === 'mcp_tools') {
-    return idx.tools
-      .filter((t) => t.is_mcp)
-      .sort((a, b) => b.tokens - a.tokens)
-      .map((t) => ({
-        kind: 'tool',
-        id: t.id,
-        title: t.name,
-        sub: t.preview,
-        tokens: t.tokens,
-        server: t.mcp_server || 'other',
-      }));
-  }
-  if (key === 'user') {
-    return idx.messages
-      .filter((m) => m.role === 'user')
-      .map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.label}`, sub: m.preview, tokens: m.tokens }));
-  }
-  if (key === 'agent') {
-    return idx.messages
-      .filter((m) => m.role === 'assistant')
-      .map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.label}`, sub: m.preview, tokens: m.tokens }));
-  }
-  if (key === 'tool') {
-    return idx.messages
-      .filter((m) => m.role === 'tool')
-      .sort((a, b) => b.tokens - a.tokens)
-      .map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.tool_name || m.label}`, sub: m.preview, tokens: m.tokens }));
-  }
-  if (key === 'system_messages') {
-    return idx.messages
-      .filter((m) => m.role === 'system')
-      .map((m) => ({ kind: 'message', id: m.id, title: `#${m.index} · ${m.label}`, sub: m.preview, tokens: m.tokens }));
-  }
-  return [];
+  return state.report ? categoryItems(state.report.index, key) : [];
 }
 
 async function fetchFullItem(kind, id, { force = false, fp = state.fingerprint } = {}) {

@@ -31,7 +31,7 @@ const {
   splitPath,
 } = CI.utils;
 const { computeSparkCoords, renderSparkline } = CI.sparkline;
-const { renderCompactControl, renderMcpServerChildren } = CI.views;
+const { categoryItems, renderCompactControl, renderMcpServerChildren } = CI.views;
 
 describe('TestFrontendUtils', () => {
   it('test_esc_escapes_html_and_xss_payloads', () => {
@@ -176,6 +176,51 @@ describe('TestFrontendSparkline', () => {
 });
 
 describe('TestFrontendViews', () => {
+  it('test_categoryItems_groups_messages_by_category_and_falls_back_to_role', () => {
+    const index = {
+      system_sections: [
+        { id: 'sys-0-identity', name: 'identity', group_type: 1, tokens: 300, preview: '' },
+        { id: 'sys-1-skills', name: 'skills', group_type: 5, tokens: 400, preview: '' },
+      ],
+      tools: [
+        { id: 'tool-0-read_file', name: 'read_file', is_mcp: false, mcp_server: '', tokens: 254, preview: '' },
+        { id: 'tool-1-mcp_github_search', name: 'mcp_github_search', is_mcp: true, mcp_server: 'github', tokens: 400, preview: '' },
+      ],
+      messages: [
+        { id: 'msg-0', index: 0, role: 'user', category: 'user', label: 'User message', tool_name: '', tokens: 100, preview: '' },
+        // SYSTEM_MESSAGE step delivered with role=user: belongs to the System messages row
+        { id: 'msg-1', index: 1, role: 'user', category: 'system_messages', label: 'System message', tool_name: '', tokens: 900, preview: '' },
+        { id: 'msg-2', index: 2, role: 'assistant', category: 'agent', label: 'Agent response', tool_name: '', tokens: 400, preview: '' },
+        { id: 'msg-3', index: 3, role: 'tool', category: 'tool', label: 'Tool result · read_file', tool_name: 'read_file', tokens: 50, preview: '' },
+        { id: 'msg-4', index: 4, role: 'user', category: 'tool', label: 'Error message', tool_name: '', tokens: 1800, preview: '' },
+        // Payloads without `category` (older backend still running) are grouped by role
+        { id: 'msg-5', index: 5, role: 'system', label: 'System message', tool_name: '', tokens: 20, preview: '' },
+        { id: 'msg-6', index: 6, role: 'role_0', label: 'Message (role_0)', tool_name: '', tokens: 0, preview: '' },
+      ],
+    };
+    const ids = (key) => Array.from(categoryItems(index, key), (item) => item.id);
+
+    assert.deepEqual(ids('user'), ['msg-0']);
+    assert.deepEqual(ids('system_messages'), ['msg-1', 'msg-5']);
+    assert.deepEqual(ids('agent'), ['msg-2']);
+    // Tool rows are ranked by token cost and titled by tool name when there is one
+    assert.deepEqual(ids('tool'), ['msg-4', 'msg-3']);
+    assert.equal(categoryItems(index, 'tool')[0].title, '#4 · Error message');
+    assert.equal(categoryItems(index, 'tool')[1].title, '#3 · read_file');
+    assert.equal(categoryItems(index, 'system_messages')[0].title, '#1 · System message');
+
+    // Sections and tools keep their existing grouping
+    assert.deepEqual(ids('system_prompt'), ['sys-0-identity']);
+    assert.deepEqual(ids('skills'), ['sys-1-skills']);
+    assert.deepEqual(ids('system_tools'), ['tool-0-read_file']);
+    assert.deepEqual(ids('mcp_tools'), ['tool-1-mcp_github_search']);
+    assert.equal(categoryItems(index, 'mcp_tools')[0].server, 'github');
+
+    // Unknown rows and a missing index yield nothing
+    assert.equal(categoryItems(index, 'system_overhead').length, 0);
+    assert.equal(categoryItems(null, 'user').length, 0);
+  });
+
   it('test_renderCompactControl_thresholds_phases_and_tooltips', () => {
     const sendSettings = { compactThreshold: 60, compactAction: 'send' };
     const copySettings = { compactThreshold: 60, compactAction: 'copy' };

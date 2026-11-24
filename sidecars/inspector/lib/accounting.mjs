@@ -130,6 +130,22 @@ export const SYSTEM_PROMPT_SUBGROUPS = {
   subagents: TOKEN_SUBAGENTS,
 };
 
+// Breakdown group types this parser understands. Any other type (e.g. 0 "Unspecified",
+// which carries the Identity section) is treated as TOKEN_SYSTEM_PROMPT by both
+// accounting.mjs and content.mjs, so its tokens stay in the total and the drill-down.
+export const KNOWN_GROUP_TYPES = new Set([
+  TOKEN_SYSTEM_PROMPT,
+  TOKEN_TOOLS,
+  TOKEN_RULES,
+  TOKEN_MCP_TOOLS,
+  TOKEN_SKILLS,
+  TOKEN_SUBAGENTS,
+  TOKEN_CHAT_MESSAGES,
+  TOKEN_WORKFLOWS,
+  TOKEN_PLUGINS,
+  TOKEN_FLOWS,
+]);
+
 export const GROUP_LABELS = {
   [TOKEN_SYSTEM_PROMPT]: 'System prompt',
   [TOKEN_TOOLS]: 'System tools',
@@ -180,6 +196,9 @@ export const CAT_TOOL = 2;
 export const CAT_CHECKPOINT = 3;
 export const CAT_SYSTEM = 4;
 
+// Conversation category row keys, in the order chatTokensByCategory() reports them.
+export const CHAT_CATEGORY_KEYS = ['user', 'agent', 'tool', 'system_messages'];
+
 export const NATIVE_CONTEXT_WINDOWS = [
   ['gemini', 1_048_576],
   ['claude-sonnet-5', 1_000_000],
@@ -220,6 +239,10 @@ export const CONV_ID_JSON_RE = new RegExp(`"conversationId"\\s*:\\s*"(${UUID_PAT
 export const MAX_HISTORY_POINTS = 120;
 
 const INT_LABEL_RE = /^[+-]?[0-9]+$/;
+const MESSAGE_LABEL_RE = /^Message ([0-9]+) \(CHAT_MESSAGE_SOURCE_([A-Z0-9_]+)\)$/;
+// Source names used by "Message <n> (CHAT_MESSAGE_SOURCE_<NAME>)" labels.
+// SYSTEM is the model's own turn (role 2, "assistant" in content.mjs).
+const MESSAGE_SOURCE_CATS = { USER: CAT_USER, SYSTEM: CAT_AGENT, TOOL: CAT_TOOL };
 
 // --- Formatting helpers ------------------------------------------------------
 
@@ -256,7 +279,34 @@ function safeDecodeURIComponent(s) {
   }
 }
 
-export function shortenPath(uri) {
+const WINDOWS_DRIVE_RE = /^[A-Za-z]:(\/|$)/;
+
+/**
+ * Whether forward-slash path `p` is `home` or lies inside it. A drive-letter home is
+ * compared ignoring case: Windows paths are case-insensitive, and Antigravity stores
+ * most of them with a lowercase drive letter (c:/Users/...) while os.homedir()
+ * reports C:\Users\...
+ */
+function isUnderHome(p, home) {
+  if (p.length !== home.length && p[home.length] !== '/') {
+    return false;
+  }
+  const head = p.slice(0, home.length);
+  return WINDOWS_DRIVE_RE.test(home) ? head.toLowerCase() === home.toLowerCase() : head === home;
+}
+
+/**
+ * Key under which two spellings of the same shortened path count as one file
+ * (Windows paths differing only in case).
+ */
+export function pathDedupeKey(shortPath, home = os.homedir()) {
+  const homeDir = String(home ?? '').replace(/\\/g, '/');
+  return WINDOWS_DRIVE_RE.test(homeDir) || WINDOWS_DRIVE_RE.test(shortPath)
+    ? shortPath.toLowerCase()
+    : shortPath;
+}
+
+export function shortenPath(uri, home = os.homedir()) {
   let p = String(uri ?? '');
   if (p.startsWith('file:')) {
     try {
@@ -270,10 +320,10 @@ export function shortenPath(uri) {
       p = p.slice(1);
     }
   }
-  const home = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '');
+  const homeDir = String(home ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
   p = p.replace(/\\/g, '/');
-  if (home && (p === home || p.startsWith(home + '/'))) {
-    return '~' + p.slice(home.length);
+  if (homeDir && isUnderHome(p, homeDir)) {
+    return '~' + p.slice(homeDir.length);
   }
   return p;
 }
@@ -290,6 +340,47 @@ export function stepCategory(stepType) {
     return CAT_SYSTEM;
   }
   return CAT_TOOL;
+}
+
+/**
+ * Category row key ('user' | 'agent' | 'tool' | 'system_messages') for a CAT_* value.
+ * Checkpoint summaries count as agent output, matching collectStats().
+ * @param {number} cat
+ */
+export function chatCategoryKey(cat) {
+  if (cat === CAT_USER) return 'user';
+  if (cat === CAT_AGENT || cat === CAT_CHECKPOINT) return 'agent';
+  if (cat === CAT_TOOL) return 'tool';
+  return 'system_messages';
+}
+
+/**
+ * Parse a TOKEN_CHAT_MESSAGES breakdown child label. Two formats exist:
+ *   "<stepIdx>: <STEP_TYPE>"                    keyed by step index
+ *   "Message <n> (CHAT_MESSAGE_SOURCE_<NAME>)"  keyed by message index
+ * Step type names missing from STEP_TYPES count as tools, like stepCategory() does
+ * for unlisted step types.
+ * @param {string} label
+ * @returns {{ key: 'step' | 'message', index: number, name: string, cat: number } | null}
+ */
+export function parseChatLabel(label) {
+  const text = String(label ?? '');
+  const sepIdx = text.indexOf(': ');
+  if (sepIdx !== -1) {
+    const left = text.slice(0, sepIdx);
+    const name = text.slice(sepIdx + 2);
+    if (!INT_LABEL_RE.test(left) || !name) {
+      return null;
+    }
+    const cat = Object.hasOwn(STEP_TYPES, name) ? stepCategory(STEP_TYPES[name]) : CAT_TOOL;
+    return { key: 'step', index: Number.parseInt(left, 10), name, cat };
+  }
+  const m = MESSAGE_LABEL_RE.exec(text);
+  if (m === null) {
+    return null;
+  }
+  const cat = Object.hasOwn(MESSAGE_SOURCE_CATS, m[2]) ? MESSAGE_SOURCE_CATS[m[2]] : CAT_SYSTEM;
+  return { key: 'message', index: Number.parseInt(m[1], 10), name: m[2], cat };
 }
 
 export function isSkillFile(filePath) {
@@ -503,27 +594,12 @@ export function chatTokensByCategory(items) {
     return [false, out];
   }
   for (const it of items) {
-    const label = it.str(1);
-    const sepIdx = label.indexOf(': ');
-    if (sepIdx === -1) {
+    const parsed = parseChatLabel(it.str(1));
+    if (parsed === null) {
       return [false, [0, 0, 0, 0]];
     }
-    const left = label.slice(0, sepIdx);
-    const right = label.slice(sepIdx + 2);
-    if (!INT_LABEL_RE.test(left) || !Object.hasOwn(STEP_TYPES, right)) {
-      return [false, [0, 0, 0, 0]];
-    }
-    const cat = stepCategory(STEP_TYPES[right]);
     const tok = Math.max(0, it.int(3, { signed32: true }));
-    if (cat === CAT_USER) {
-      out[0] += tok;
-    } else if (cat === CAT_AGENT || cat === CAT_CHECKPOINT) {
-      out[1] += tok;
-    } else if (cat === CAT_TOOL) {
-      out[2] += tok;
-    } else {
-      out[3] += tok;
-    }
+    out[CHAT_CATEGORY_KEYS.indexOf(chatCategoryKey(parsed.cat))] += tok;
   }
   return [true, out];
 }
@@ -964,22 +1040,24 @@ export function collectStats(steps, gen, limit) {
     if (edit !== null) {
       const uri = edit.str(CODE_ACTION_EDIT_URI_FIELD);
       const short = shortenPath(uri);
-      if (ca.int(CODE_ACTION_IS_ARTIFACT_FIELD) && !seenA.has(uri)) {
-        seenA.add(uri);
+      const key = pathDedupeKey(short);
+      if (ca.int(CODE_ACTION_IS_ARTIFACT_FIELD) && !seenA.has(key)) {
+        seenA.add(key);
         artifacts.push({ path: short, tokens: tok });
       }
-      if (ca.int(CODE_ACTION_IS_KNOWLEDGE_FIELD) && !seenK.has(uri)) {
-        seenK.add(uri);
+      if (ca.int(CODE_ACTION_IS_KNOWLEDGE_FIELD) && !seenK.has(key)) {
+        seenK.add(key);
         knowledge.push({ path: short, tokens: tok });
       }
     }
 
     const vf = step.payload(STEP_VIEW_FILE);
     if (vf !== null && vf.int(VIEW_FILE_IS_SKILL_FIELD)) {
-      const uri = vf.str(VIEW_FILE_PATH_FIELD);
-      if (!seenS.has(uri)) {
-        seenS.add(uri);
-        skillFiles.push({ path: shortenPath(uri), tokens: tok });
+      const short = shortenPath(vf.str(VIEW_FILE_PATH_FIELD));
+      const key = pathDedupeKey(short);
+      if (!seenS.has(key)) {
+        seenS.add(key);
+        skillFiles.push({ path: short, tokens: tok });
       }
     }
   }
@@ -996,7 +1074,8 @@ export function collectStats(steps, gen, limit) {
     for (const g of breakdown.msgs(1)) {
       const gtype = g.int(2);
       const gtok = Math.max(0, g.int(4, { signed32: true }));
-      if (gtype === TOKEN_SYSTEM_PROMPT) {
+      const isPromptGroup = gtype === TOKEN_SYSTEM_PROMPT;
+      if (isPromptGroup || !KNOWN_GROUP_TYPES.has(gtype)) {
         let extracted = 0;
         for (const child of g.msgs(5)) {
           const name = child.str(1);
@@ -1013,7 +1092,10 @@ export function collectStats(steps, gen, limit) {
           extracted += ctok;
         }
         st.system_prompt += Math.max(0, gtok - extracted);
-        seenPrompt = true;
+        // Only a real system prompt group turns off the overhead estimate below.
+        if (isPromptGroup) {
+          seenPrompt = true;
+        }
       } else if (gtype === TOKEN_TOOLS) {
         st.system_tools += gtok;
         seenTools = true;
@@ -1045,7 +1127,8 @@ export function collectStats(steps, gen, limit) {
       const knownCustom =
         st.rules + st.skills + st.subagents +
         st.legacy_workflows + st.workflows + st.plugins + st.mcp_tools;
-      st.system_overhead = Math.max(0, apiInput - chatTok - knownCustom);
+      // With no real prompt group, st.system_prompt holds only unknown-type groups.
+      st.system_overhead = Math.max(0, apiInput - chatTok - knownCustom - st.system_prompt);
     }
 
     if (chatTok > 0 && !hasNewer) {
